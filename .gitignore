@@ -1,0 +1,10 @@
+# 编译输出
+target/
+out/
+build/
+
+# macOS
+.DS_Store
+
+# 日志
+*.log
