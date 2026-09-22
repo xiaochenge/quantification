@@ -1,0 +1,44 @@
+# ============================================================
+# 数据库配置（可以提交到 GitHub，里面没有明文密码）
+#
+# 真实密码在 application-local.yml 里，那个文件已被 .gitignore 排除。
+# 默认走 local，也就是连测试库；上线时用参数切到生产库：
+#   java -jar xxx.jar --spring.profiles.active=prod
+# ============================================================
+
+spring:
+  application:
+    name: quantification
+  profiles:
+    active: local
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 5000
+      # 下面两个要比 MySQL 服务端的 wait_timeout 小，
+      # 否则会用到已经被服务端悄悄断掉的连接，报 "communications link failure"
+      idle-timeout: 300000
+      max-lifetime: 600000
+
+---
+# ===== 本地开发环境：连测试库 =====
+spring:
+  config:
+    activate:
+      on-profile: local
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/quantification_test?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: quant_app
+    password: ${DB_PASSWORD:}
+
+---
+# ===== 生产环境：连生产库 =====
+spring:
+  config:
+    activate:
+      on-profile: prod
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/quantification_prod?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: quant_app
+    password: ${DB_PASSWORD:}

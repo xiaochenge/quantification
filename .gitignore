@@ -10,3 +10,6 @@ build/
 *.log
 #本地配置
 .idea/
+
+# 本地数据库密码，绝不提交
+src/main/resources/application-local.yml
