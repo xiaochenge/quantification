@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+#
+# 提交前拦截：防止误把密钥提交进仓库。
+#
+# 启用方式（每个克隆做一次）：
+#   git config core.hooksPath .githooks
+#
+# 只检查本次要提交的新增/修改文件（删除的文件不检查），
+# 实际规则复用 scripts/check-secrets.sh，保证和构建时一致。
+
+set -euo pipefail
+
+set --
+while IFS= read -r file; do
+  [ -n "$file" ] || continue
+  [ -f "$file" ] || continue
+  set -- "$@" "$file"
+done <<< "$(git diff --cached --name-only --diff-filter=ACM)"
+
+if [ "$#" -eq 0 ]; then
+  exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+exec "$repo_root/scripts/check-secrets.sh" "$@"

@@ -1,8 +1,12 @@
 # ============================================================
-# 数据库配置（可以提交到 GitHub，里面没有明文密码）
+# 应用配置（可以提交到 GitHub —— 这里没有任何密钥）
 #
-# 真实密码在 application-local.yml 里，那个文件已被 .gitignore 排除。
-# 默认走 local，也就是连测试库；上线时用参数切到生产库：
+# 密钥（数据库密码、Bitget API Key）不在本文件、也不在仓库里，
+# 而是放在仓库外的：~/.quantification/application-local.yml
+# 由下面的 spring.config.import 自动加载。该文件不会被 git 跟踪，
+# 也不会被打进 jar（pom 里有构建校验，命中密钥会直接构建失败）。
+#
+# 默认走 local（连测试库）；上线时用参数切到生产库：
 #   java -jar xxx.jar --spring.profiles.active=prod
 # ============================================================
 
@@ -11,6 +15,15 @@ spring:
     name: quantification
   profiles:
     active: local
+  # 从仓库外加载密钥文件。optional 表示文件缺失时仍能启动（会打印告警）；
+  # 环境变量优先级高于配置文件，所以 DB_PASSWORD 等仍可覆盖。
+  config:
+    import: optional:file:${user.home}/.quantification/application-local.yml
+  # 定时任务线程池：默认只有 1 个线程，篮子同步/实时费率/历史回补会互相排队
+  task:
+    scheduling:
+      pool:
+        size: 4
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
@@ -21,6 +34,42 @@ spring:
       idle-timeout: 300000
       max-lifetime: 600000
 
+# MyBatis：把数据库的下划线字段自动映射到 Java 的驼峰属性
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+
+# Bitget 接入
+#   base-url    ：接口地址（公共行情无需密钥）
+#   paptrading  ：true = 走官方模拟盘（用 demo-* 密钥 + paptrading:1 请求头，虚拟资金）；
+#                 false = 走实盘。默认 false，本地配置里改成 true 即进入模拟。
+#                 两套密钥都在仓库外的 ~/.quantification/application-local.yml 里，不提交、不打包。
+bitget:
+  base-url: https://api.bitget.com
+  paptrading: false
+
+# 数据采集调度
+collector:
+  current-initial-delay-ms: 5000     # 启动 5 秒后开始第一次
+  current-interval-ms: 600000        # 实时资金费率：每 10 分钟
+  history-initial-delay-ms: 8000     # 启动 8 秒后开始第一次
+  history-interval-ms: 21600000      # 历史资金费率回补：每 6 小时
+  fee-rate-initial-delay-ms: 15000   # 启动 15 秒后采一次费率（等篮子同步完）
+  fee-rate-interval-ms: 86400000     # 手续费率（账户真实值）：每天一次
+
+# 收益计算参数（对应 /api/admin/funding-yield）
+funding-yield:
+  lookback-days: 90          # 统计窗口天数，接口最多给 90 天
+  rotation-days: 45          # 平均多少天切换一次币种
+  spot-taker-fee-rate: 0.0006  # 现货吃单费率（私有接口实测：0.06%）
+  perp-taker-fee-rate: 0.000375 # 合约吃单费率（私有接口实测：0.0375%，公共接口给的是标准值 0.06%）
+
+# 监控篮子自动同步（把"现货 + U 本位永续都有"的币全部纳入）
+watch-coin:
+  min-turnover: 5000000         # 目标币种池：24h 成交额下限（USDT），默认 500 万
+  sync-initial-delay-ms: 3000   # 启动 3 秒后同步一次（必须早于资金费率采集）
+  sync-interval-ms: 86400000    # 之后每天同步一次
+
 ---
 # ===== 本地开发环境：连测试库 =====
 spring:
@@ -30,7 +79,7 @@ spring:
   datasource:
     url: jdbc:mysql://127.0.0.1:3306/quantification_test?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
     username: quant_app
-    password: ${DB_PASSWORD:}
+    # 密码不写在这里，来自仓库外的 ~/.quantification/application-local.yml
 
 ---
 # ===== 生产环境：连生产库 =====
@@ -41,4 +90,4 @@ spring:
   datasource:
     url: jdbc:mysql://127.0.0.1:3306/quantification_prod?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
     username: quant_app
-    password: ${DB_PASSWORD:}
+    # 密码不写在这里，来自仓库外的 ~/.quantification/application-local.yml

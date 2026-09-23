@@ -39,7 +39,7 @@ mkdir -p "$MYSQL_BASE"
 # ===== 1. 下载并解压 =====
 if [ ! -d "$MYSQL_HOME" ]; then
   if [ ! -f "$TARBALL" ]; then
-    echo "==> 下载 MySQL $MYSQL_VERSION（约 170MB）"
+    echo "==> 下载 MySQL ${MYSQL_VERSION}（约 170MB）"
     curl -L --fail -o "$TARBALL" "$DOWNLOAD_URL"
   fi
   echo "==> 解压到 $MYSQL_BASE"
@@ -55,7 +55,7 @@ if [ ! -d "$DATA_DIR/mysql" ]; then
 fi
 
 # ===== 3. 启动服务 =====
-echo "==> 启动 mysqld（端口 $PORT，仅监听本机）"
+echo "==> 启动 mysqld（端口 ${PORT}，仅监听本机）"
 "$MYSQL_HOME/bin/mysqld" \
   --basedir="$MYSQL_HOME" \
   --datadir="$DATA_DIR" \

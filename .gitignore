@@ -13,3 +13,6 @@ build/
 
 # 本地数据库密码，绝不提交
 src/main/resources/application-local.yml
+
+# 密钥文件已移到仓库外的 ~/.quantification/，这里再防一手
+**/application-local.yml
