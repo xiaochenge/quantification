@@ -63,4 +63,20 @@ public interface FundingRateHistoryMapper {
      */
     @Select("SELECT COUNT(*) FROM funding_rate_history WHERE symbol = #{symbol}")
     int countBySymbol(@Param("symbol") String symbol);
+
+    /**
+     * 取某个币种最近若干笔结算（按时间倒序），用于"恢复轮数"过滤。
+     *
+     * @param symbol 交易对
+     * @param limit  取多少笔
+     * @return 最近结算列表（新的在前）
+     */
+    @Select("""
+            SELECT id, symbol, category, funding_rate, funding_time
+            FROM funding_rate_history
+            WHERE symbol = #{symbol}
+            ORDER BY funding_time DESC
+            LIMIT #{limit}
+            """)
+    List<FundingRateHistory> findRecent(@Param("symbol") String symbol, @Param("limit") int limit);
 }

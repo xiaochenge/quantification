@@ -8,6 +8,7 @@ import com.quantification.mapper.WatchCoinMapper;
 import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.slf4j.Logger;
@@ -43,18 +44,32 @@ public class WatchCoinService {
     /** USDT 计价后缀，用来把交易对切成基础币。 */
     private static final String QUOTE_SUFFIX = "USDT";
 
+    /**
+     * 模拟盘现货报价与真实市场允许的最大偏离。
+     *
+     * <p>实测（2026-09-23）：模拟盘 ETH 卖一 54500 而真实市价 2663、SOL 偏离 55%，
+     * 这类币在模拟盘**永远成交不了**（可下单价位与盘口卖单完全脱节）。
+     * 所以同步时做一次校验，偏离过大的币直接标记为"模拟盘不可交易"。
+     */
+    private static final BigDecimal MAX_DEMO_QUOTE_DEVIATION = new BigDecimal("0.05");
+
     private final BitgetPublicClient bitget;
     private final WatchCoinMapper watchCoinMapper;
 
     /** 目标币种池的 24 小时成交额下限（USDT）。 */
     private final BigDecimal minTurnover;
 
+    /** 目标币种池的保证金折扣率下限（低于此值强平风险过高）。 */
+    private final BigDecimal minDiscountRate;
+
     public WatchCoinService(BitgetPublicClient bitget,
                             WatchCoinMapper watchCoinMapper,
-                            @Value("${watch-coin.min-turnover:5000000}") BigDecimal minTurnover) {
+                            @Value("${watch-coin.min-turnover:5000000}") BigDecimal minTurnover,
+                            @Value("${watch-coin.min-discount-rate:0.8}") BigDecimal minDiscountRate) {
         this.bitget = bitget;
         this.watchCoinMapper = watchCoinMapper;
         this.minTurnover = minTurnover;
+        this.minDiscountRate = minDiscountRate;
     }
 
     /** 定时同步篮子（默认启动 3 秒后一次，之后每天一次，见 application.yml）。 */
@@ -71,15 +86,20 @@ public class WatchCoinService {
      */
     @Transactional
     public SyncResult syncEligibleCoins() {
-        Set<String> spotSymbols = usdtSymbols(BitgetPublicClient.SPOT);
-        Set<String> futuresSymbols = usdtSymbols(BitgetPublicClient.USDT_FUTURES);
+        Set<String> spotSymbols = usdtSymbols(BitgetPublicClient.SPOT, false);
+        Set<String> futuresSymbols = usdtSymbols(BitgetPublicClient.USDT_FUTURES, false);
+        // 模拟盘支持范围不同，单独拉一份，记到 demo_supported 字段（不需要额外配置）
+        Set<String> demoSpot = usdtSymbols(BitgetPublicClient.SPOT, true);
+        Set<String> demoPerp = usdtSymbols(BitgetPublicClient.USDT_FUTURES, true);
         Map<String, BigDecimal> turnover = turnoverBySymbol(BitgetPublicClient.USDT_FUTURES);
+        Map<String, BigDecimal> discountRates = discountRateByCoin();
 
         // 先全部停用，再把达标的重新启用：不达标的老币会被自动淘汰
         watchCoinMapper.disableAll();
 
         int enabled = 0;
         int skippedByTurnover = 0;
+        int skippedByDiscount = 0;
         for (String symbol : futuresSymbols) {
             if (!spotSymbols.contains(symbol)) {
                 continue;
@@ -92,30 +112,102 @@ public class WatchCoinService {
             if (baseCoin.isEmpty()) {
                 continue;
             }
-            watchCoinMapper.upsert(toWatchCoin(baseCoin, symbol));
+            // 折扣率太低意味着现货几乎不能抵保证金，强平风险过高，直接排除
+            BigDecimal discountRate = discountRates.get(baseCoin);
+            if (discountRate == null || discountRate.compareTo(minDiscountRate) < 0) {
+                skippedByDiscount++;
+                continue;
+            }
+            boolean demoTradable = demoSpot.contains(symbol) && demoPerp.contains(symbol);
+            if (demoTradable && !demoQuoteSane(symbol)) {
+                log.warn("{} 的模拟盘现货报价异常（与真实市场偏离超过 {}），标记为模拟盘不可交易",
+                        symbol, MAX_DEMO_QUOTE_DEVIATION);
+                demoTradable = false;
+            }
+            watchCoinMapper.upsert(toWatchCoin(baseCoin, symbol, discountRate, demoTradable));
             enabled++;
         }
 
         SyncResult result = new SyncResult(spotSymbols.size(), futuresSymbols.size(),
-                enabled, skippedByTurnover, minTurnover);
+                enabled, skippedByTurnover, skippedByDiscount, minTurnover, minDiscountRate);
         log.info("监控篮子同步完成：{}", result);
         return result;
     }
 
-    private WatchCoin toWatchCoin(String baseCoin, String symbol) {
+    private WatchCoin toWatchCoin(String baseCoin, String symbol, BigDecimal discountRate, boolean demoTradable) {
         WatchCoin row = new WatchCoin();
         row.setBaseCoin(baseCoin);
         row.setSpotSymbol(symbol);
         row.setFuturesSymbol(symbol);
         row.setFuturesCategory(BitgetPublicClient.USDT_FUTURES);
+        row.setDiscountRate(discountRate);
+        row.setRealSupported(1);
+        row.setDemoSupported(demoTradable ? 1 : 0);
         row.setNote("自动同步");
         return row;
     }
 
+    /** 取各币种的保证金折扣率（用第一档，即小额持仓那一档）。 */
+    private Map<String, BigDecimal> discountRateByCoin() {
+        Map<String, BigDecimal> map = new HashMap<>();
+        for (BitgetPublicClient.DiscountRate rate : bitget.discountRates()) {
+            if (rate.list() == null || rate.list().isEmpty()) {
+                continue;
+            }
+            String value = rate.list().get(0).discountRate();
+            if (value == null || value.isBlank()) {
+                continue;
+            }
+            try {
+                map.put(rate.coin(), new BigDecimal(value));
+            } catch (NumberFormatException ignored) {
+                // 交易所偶尔返回非数字，忽略该条
+            }
+        }
+        return map;
+    }
+
+    /**
+     * 校验模拟盘的现货报价是否可信。
+     *
+     * <p>做法：把模拟盘的最优卖价与真实市场的最优卖价对比，偏离超过阈值即视为不可信。
+     * 取不到数据时不拦（宁可放行，也不因为接口抖动把正常币误杀）。
+     *
+     * @param symbol 交易对
+     * @return true = 报价可信（模拟盘可交易）
+     */
+    private boolean demoQuoteSane(String symbol) {
+        try {
+            BigDecimal real = bestAsk(symbol, false);
+            BigDecimal demo = bestAsk(symbol, true);
+            if (real == null || demo == null || real.signum() <= 0) {
+                return true;
+            }
+            BigDecimal deviation = demo.subtract(real).abs()
+                    .divide(real, 6, java.math.RoundingMode.HALF_UP);
+            return deviation.compareTo(MAX_DEMO_QUOTE_DEVIATION) <= 0;
+        } catch (Exception e) {
+            log.warn("校验模拟盘报价失败 {}：{}", symbol, e.getMessage());
+            return true;
+        }
+    }
+
+    /** @return 现货最优卖价（demo=true 取模拟盘） */
+    private BigDecimal bestAsk(String symbol, boolean demo) {
+        BitgetPublicClient.OrderBook book = demo
+                ? bitget.demoOrderBook(BitgetPublicClient.SPOT, symbol, 5)
+                : bitget.orderBook(BitgetPublicClient.SPOT, symbol, 5);
+        if (book.asks() == null || book.asks().isEmpty()) {
+            return null;
+        }
+        return new BigDecimal(book.asks().get(0).get(0));
+    }
+
     /** 取某个产品线下所有 USDT 计价的交易对，排除 RWA 与 Reality 股票代币。 */
-    private Set<String> usdtSymbols(String category) {
+    private Set<String> usdtSymbols(String category, boolean demo) {
         Set<String> symbols = new LinkedHashSet<>();
-        for (InstrumentInfo info : bitget.instruments(category)) {
+        List<InstrumentInfo> infos = demo ? bitget.demoInstruments(category) : bitget.instruments(category);
+        for (InstrumentInfo info : infos) {
             if (info.symbol() == null || !info.symbol().endsWith(QUOTE_SUFFIX)) {
                 continue;
             }
@@ -156,9 +248,12 @@ public class WatchCoinService {
      * @param futuresSymbols    交易所上 USDT 计价的永续交易对数
      * @param enabled           本次纳入篮子的币种数（启用状态）
      * @param skippedByTurnover 因 24h 成交额不达标被排除的币种数
+     * @param skippedByDiscount 因保证金折扣率不达标被排除的币种数
      * @param minTurnover       本次使用的成交额门槛
+     * @param minDiscountRate   本次使用的折扣率门槛
      */
     public record SyncResult(int spotSymbols, int futuresSymbols, int enabled,
-                             int skippedByTurnover, BigDecimal minTurnover) {
+                             int skippedByTurnover, int skippedByDiscount,
+                             BigDecimal minTurnover, BigDecimal minDiscountRate) {
     }
 }

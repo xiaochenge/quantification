@@ -67,8 +67,72 @@ funding-yield:
 # 监控篮子自动同步（把"现货 + U 本位永续都有"的币全部纳入）
 watch-coin:
   min-turnover: 5000000         # 目标币种池：24h 成交额下限（USDT），默认 500 万
+  min-discount-rate: 0.8        # 目标币种池：保证金折扣率下限（低于此值强平风险高）
   sync-initial-delay-ms: 3000   # 启动 3 秒后同步一次（必须早于资金费率采集）
   sync-interval-ms: 86400000    # 之后每天同步一次
+
+# ============================================================
+# 策略（模块 3~5）。改这里就能调策略行为，改完重启生效。
+# ============================================================
+strategy:
+  # 总开关。false = 只评估、不下单（第一次跑建议先设 false 观察日志）
+  enabled: true
+  # 实盘下单的二次确认：paptrading=false（实盘）时，必须同时把这里设为 true 才会真实下单。
+  # 这是防止"以为在模拟盘、结果下了真单"的安全闸。
+  allow-real-trading: false
+  evaluate-interval-ms: 3600000  # 评估频率：每小时一次
+  lookback-days: 10              # 综合费率窗口（天），正负累加
+  # 建仓门槛：净年化。正常用 0.05；
+  # 临时降到 0.04 是为了在官方模拟盘上跑通流程（模拟盘只支持 BTC/ETH/DOGE/SOL，
+  # 其中现货报价可信的只有 BTC，而 BTC 净年化约 4.5%）。验证完请改回 0.05。
+  entry-net: 0.04
+  switch-gap: 0.04               # 换仓门槛：候选比最差持仓高 4 个百分点
+  max-holdings: 3                # 最多同时持有几个币
+  max-single-weight: 0.40        # 单币仓位上限（占总资金）
+  recovery-filter: true          # 是否要求"连续为正轮数 > 历史平均恢复轮数"
+  target-invest-ratio: 0.95      # 目标投入比例（留 5% 余量做保证金缓冲）
+
+# 下单执行（模块 5）
+execution:
+  order-timeout-ms: 5000         # IOC 限价单等待成交的上限，超时撤单
+  max-retries: 2                 # 超时后重新取盘口重下的次数
+  leg-tolerance: 0.005           # 两腿数量容差（0.5%）
+  # 限价缓冲：限价 = 对手价 ± 该比例。缓冲只是"能接受的最差价"，
+  # FOK 限价单的实际成交价仍是盘口价，所以放宽缓冲几乎不增加成本，只提高成交概率。
+  price-buffer: 0.01
+  slippage-limit-major: 0.0005   # 主流币滑点上限（每条腿）
+  slippage-limit-small: 0.0015   # 小币滑点上限（每条腿）
+  major-turnover: 50000000       # 24h 成交额 ≥ 此值算主流币
+  min-order-notional: 20         # 单笔最小名义金额（USDT），低于则跳过
+  depth-limit: 100               # 取盘口多少档用于估算可下单量
+
+# 交易对规则同步（模块 2/5）：精度、最小/最大值、乘数必须落库，下单时从库里取
+# 教训：参数绝不能猜，也不要下单时临时查——曾因数量精度不符导致现货腿被拒，
+# 合约腿已成交形成裸多头，正好撞上行情下跌造成实际亏损（2026-09-23）
+instrument:
+  sync-initial-delay-ms: 10000   # 启动 10 秒后同步一次（早于策略首次评估）
+  sync-interval-ms: 3600000      # 之后每小时同步一次
+
+# 风控（模块 6）
+risk:
+  max-drawdown: 0.05             # 账户权益从峰值回撤 5% → 全平并停止策略
+  position-watch-interval-ms: 5000  # 持仓/权益轮询间隔（每 5 秒）
+  mgn-ratio-warn: 0.5            # 维持保证金率预警线（mgnRatio = mmr / effEquity）
+  mgn-ratio-reduce: 0.8          # 维持保证金率减仓线
+  mark-index-deviation-warn: 0.01   # 标记价与指数价偏离 1% → 告警
+  mark-index-deviation-pause: 0.03  # 偏离 3% → 暂停开新仓
+  mark-index-deviation-halt: 0.05   # 偏离 5% → 熔断
+
+# 告警（模块 6）。密码属于密钥，只放仓库外的 application-local.yml
+alert:
+  mail:
+    enabled: false               # 先关闭；配好 SMTP 后改成 true
+    host: ""
+    port: 465
+    username: ""
+    password: ""
+    from: ""
+    to: ""
 
 ---
 # ===== 本地开发环境：连测试库 =====

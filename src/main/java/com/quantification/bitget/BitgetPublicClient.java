@@ -1,5 +1,6 @@
 package com.quantification.bitget;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import java.util.List;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
@@ -100,10 +101,33 @@ public class BitgetPublicClient {
      * @throws BitgetApiException 接口返回非成功码或响应结构异常
      */
     public List<InstrumentInfo> instruments(String category) {
+        return instruments(category, false);
+    }
+
+    /**
+     * 查询**模拟盘**支持的交易对清单。
+     *
+     * <p>实测：公开产品接口加上 {@code paptrading: 1} 头就会返回模拟盘清单（无需签名）。
+     * 模拟盘只覆盖少数币种，同步篮子时要单独拉这份名单，避免对模拟盘不支持的币下单。
+     *
+     * @param category 产品线
+     * @return 模拟盘支持该产品线的交易对列表
+     */
+    public List<InstrumentInfo> demoInstruments(String category) {
+        return instruments(category, true);
+    }
+
+    private List<InstrumentInfo> instruments(String category, boolean demo) {
         BitgetResponse<List<InstrumentInfo>> resp = client.get()
                 .uri(uri -> uri.path("/api/v3/market/instruments")
                         .queryParam("category", category)
                         .build())
+                .headers(h -> {
+                    // 加这个头会返回模拟盘的支持清单（公开接口，无需签名）
+                    if (demo) {
+                        h.set("paptrading", "1");
+                    }
+                })
                 .retrieve()
                 .body(new ParameterizedTypeReference<BitgetResponse<List<InstrumentInfo>>>() {});
         if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
@@ -129,6 +153,74 @@ public class BitgetPublicClient {
                 .body(new ParameterizedTypeReference<BitgetResponse<List<Ticker>>>() {});
         if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
             throw new BitgetApiException("tickers 调用失败: "
+                    + (resp == null ? "无响应" : resp.code() + " " + resp.msg()));
+        }
+        return resp.data();
+    }
+
+    /**
+     * 查询各币种的保证金折扣率（决定现货能抵多少保证金）。
+     *
+     * @return 每个币种一条，含分档的折扣率列表
+     * @throws BitgetApiException 接口返回非成功码或响应结构异常
+     */
+    public List<DiscountRate> discountRates() {
+        BitgetResponse<List<DiscountRate>> resp = client.get()
+                .uri(uri -> uri.path("/api/v3/market/discount-rate").build())
+                .retrieve()
+                .body(new ParameterizedTypeReference<BitgetResponse<List<DiscountRate>>>() {});
+        if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
+            throw new BitgetApiException("discount-rate 调用失败: "
+                    + (resp == null ? "无响应" : resp.code() + " " + resp.msg()));
+        }
+        return resp.data();
+    }
+
+    /**
+     * 查询订单簿深度（用于按盘口算"滑点上限内能吃多少量"）。
+     *
+     * @param category 产品线
+     * @param symbol   交易对
+     * @param limit    深度档数
+     * @return 订单簿，asks 为卖档（价格升序），bids 为买档（价格降序），每项 [价格, 数量]
+     * @throws BitgetApiException 接口返回非成功码或响应结构异常
+     */
+    public OrderBook orderBook(String category, String symbol, int limit) {
+        return orderBook(category, symbol, limit, false);
+    }
+
+    /**
+     * 查询**模拟盘**的订单簿。
+     *
+     * <p>为什么需要单独查：实测发现模拟盘的部分现货报价不可信（ETH 卖一 54500 而市价 3822、
+     * SOL 偏离 55%），这类币在模拟盘永远成交不了，必须在下单前识别出来并排除。
+     *
+     * @param category 产品线
+     * @param symbol   交易对
+     * @param limit    深度档数
+     * @return 模拟盘订单簿
+     * @throws BitgetApiException 接口返回非成功码或响应结构异常
+     */
+    public OrderBook demoOrderBook(String category, String symbol, int limit) {
+        return orderBook(category, symbol, limit, true);
+    }
+
+    private OrderBook orderBook(String category, String symbol, int limit, boolean demo) {
+        BitgetResponse<OrderBook> resp = client.get()
+                .uri(uri -> uri.path("/api/v3/market/orderbook")
+                        .queryParam("category", category)
+                        .queryParam("symbol", symbol)
+                        .queryParam("limit", limit)
+                        .build())
+                .headers(h -> {
+                    if (demo) {
+                        h.set("paptrading", "1");
+                    }
+                })
+                .retrieve()
+                .body(new ParameterizedTypeReference<BitgetResponse<OrderBook>>() {});
+        if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
+            throw new BitgetApiException("orderbook 调用失败: "
                     + (resp == null ? "无响应" : resp.code() + " " + resp.msg()));
         }
         return resp.data();
@@ -193,12 +285,20 @@ public class BitgetPublicClient {
      * @param makerFeeRate 挂单费率（仅合约返回）
      * @param takerFeeRate 吃单费率（仅合约返回）
      * @param minOrderQty  最小下单数量
+     * @param maxOrderQty  单笔最大下单数量（0 表示不限）
+     * @param pricePrecision    价格精度（小数位数）
+     * @param quantityPrecision 数量精度（小数位数）
+     * @param quotePrecision    市价下单的计价精度（小数位数）
+     * @param priceMultiplier   价格乘数（合约）
+     * @param quantityMultiplier 数量乘数（合约）
      * @param type         合约类型（如 perpetual 永续）
      * @param isRwa        是否 RWA 交易对（yes / no，仅现货返回）
      * @param isReality    是否 Reality 股票代币（yes / no，仅现货返回）
      */
     public record InstrumentInfo(String category, String symbol, String baseCoin, String quoteCoin,
                                  String makerFeeRate, String takerFeeRate, String minOrderQty,
+                                 String maxOrderQty, String pricePrecision, String quantityPrecision,
+                                 String quotePrecision, String priceMultiplier, String quantityMultiplier,
                                  String type, String isRwa, String isReality) {
     }
 
@@ -214,5 +314,35 @@ public class BitgetPublicClient {
      */
     public record Ticker(String symbol, String lastPrice, String turnover24h, String volume24h,
                          String fundingRate, String ts) {
+    }
+
+    /**
+     * 一个币种的保证金折扣率。
+     *
+     * @param coin 币种
+     * @param list 分档折扣率（tierStartValue 为该档起始估值，discountRate 为折扣率）
+     */
+    public record DiscountRate(String coin, List<DiscountTier> list) {
+    }
+
+    /**
+     * 折扣率的一档。
+     *
+     * @param tierStartValue 该档起始估值
+     * @param discountRate   折扣率（0~1，越大越安全）
+     */
+    public record DiscountTier(String tierStartValue, String discountRate) {
+    }
+
+    /**
+     * 订单簿。
+     *
+     * @param asks 卖档（价格升序），每项 [价格, 数量]
+     * @param bids 买档（价格降序），每项 [价格, 数量]
+     * @param ts   生成时间（毫秒）
+     */
+    public record OrderBook(@JsonProperty("a") List<List<String>> asks,
+                            @JsonProperty("b") List<List<String>> bids,
+                            @JsonProperty("ts") String ts) {
     }
 }

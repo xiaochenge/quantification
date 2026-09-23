@@ -57,12 +57,24 @@ for target in "${TARGETS[@]}"; do
       *) continue ;;
     esac
 
-    matches=$(grep -nIE "$CONTENT_PATTERN" "$file" 2>/dev/null \
-      | grep -v '[$][{]' \
-      | grep -E ':[[:space:]]*[^[:space:]#]' || true)
-    if [ -n "$matches" ]; then
+    # 逐行判断字段值是否"真的非空"：
+    #   排除 空值、只有引号（"" / ''）、以及 ${...} 占位符
+    hits=""
+    while IFS= read -r matched; do
+      [ -n "$matched" ] || continue
+      value="${matched#*:}"          # 去掉行号
+      value="${value#*:}"            # 去掉字段名
+      value="$(printf '%s' "$value" | tr -d '[:space:]')"
+      case "$value" in
+        "" | '""' | "''") continue ;;   # 空值
+        '$'*) continue ;;               # ${...} 占位符
+      esac
+      hits="${hits}${matched}
+"
+    done < <(grep -nIE "$CONTENT_PATTERN" "$file" 2>/dev/null || true)
+    if [ -n "$hits" ]; then
       printf '❌ 文件里有非空密钥字段：%s\n' "$file" >&2
-      printf '%s\n' "$matches" | head -3 >&2
+      printf '%s' "$hits" | head -3 >&2
       fail=1
     fi
   done < <(list_files "$target")

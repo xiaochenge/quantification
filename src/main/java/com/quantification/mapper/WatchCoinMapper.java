@@ -4,6 +4,7 @@ import com.quantification.entity.WatchCoin;
 import java.util.List;
 import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
 
@@ -17,7 +18,8 @@ public interface WatchCoinMapper {
      * @return 启用中的监控币种列表；没有则返回空列表
      */
     @Select("""
-            SELECT id, base_coin, spot_symbol, futures_symbol, futures_category, enabled, note
+            SELECT id, base_coin, spot_symbol, futures_symbol, futures_category, discount_rate,
+                   real_supported, demo_supported, enabled, note
             FROM watch_coin
             WHERE enabled = 1
             ORDER BY id
@@ -34,16 +36,42 @@ public interface WatchCoinMapper {
      */
     @Insert("""
             INSERT INTO watch_coin
-                (base_coin, spot_symbol, futures_symbol, futures_category, enabled, note)
+                (base_coin, spot_symbol, futures_symbol, futures_category, discount_rate,
+                 real_supported, demo_supported, enabled, note)
             VALUES
-                (#{baseCoin}, #{spotSymbol}, #{futuresSymbol}, #{futuresCategory}, 1, #{note}) AS new
+                (#{baseCoin}, #{spotSymbol}, #{futuresSymbol}, #{futuresCategory}, #{discountRate},
+                 #{realSupported}, #{demoSupported}, 1, #{note}) AS new
             ON DUPLICATE KEY UPDATE
                 spot_symbol = new.spot_symbol,
                 futures_symbol = new.futures_symbol,
                 futures_category = new.futures_category,
+                discount_rate = new.discount_rate,
+                real_supported = new.real_supported,
+                demo_supported = new.demo_supported,
                 enabled = 1
             """)
     int upsert(WatchCoin row);
+
+    /**
+     * 查询"当前运行模式下可交易"的币种。
+     *
+     * <p>模拟盘与实盘的支持范围不同（模拟盘只覆盖少数币），所以按模式过滤，
+     * 避免在模拟盘里对不支持的币下单。
+     *
+     * @param paperTrading true = 模拟盘（取 demo_supported），false = 实盘（取 real_supported）
+     * @return 该模式下可交易的币种列表
+     */
+    @Select("""
+            <script>
+            SELECT id, base_coin, spot_symbol, futures_symbol, futures_category, discount_rate,
+                   real_supported, demo_supported, enabled, note
+            FROM watch_coin
+            WHERE enabled = 1
+              AND <choose><when test="paperTrading">demo_supported</when><otherwise>real_supported</otherwise></choose> = 1
+            ORDER BY id
+            </script>
+            """)
+    List<WatchCoin> findTradable(@Param("paperTrading") boolean paperTrading);
 
     /**
      * 把所有币种置为停用。
