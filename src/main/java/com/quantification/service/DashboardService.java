@@ -6,6 +6,7 @@ import com.quantification.bitget.BitgetPublicClient.Ticker;
 import com.quantification.entity.AccountBalanceSnapshot;
 import com.quantification.entity.EventLog;
 import com.quantification.entity.FundingRateHistory;
+import com.quantification.entity.FundingRateStat;
 import com.quantification.entity.WatchCoin;
 import com.quantification.exchange.ExchangeGateway;
 import com.quantification.exchange.MockExchangeGateway;
@@ -17,6 +18,8 @@ import com.quantification.mapper.WatchCoinMapper;
 import com.quantification.service.FundingYieldService.FundingYield;
 import com.quantification.service.SimulationService.SimulationStatus;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -157,44 +160,112 @@ public class DashboardService {
             basket.put(coin.getFuturesSymbol(), coin);
         }
         Map<String, BigDecimal> turnover = turnover();
+        Map<String, FundingRateStat> allStats = new HashMap<>();
+        for (FundingRateStat stat : historyMapper.summarizeAll()) {
+            allStats.put(stat.getSymbol(), stat);
+        }
         List<CandidateView> result = new ArrayList<>();
         for (FundingYield yield : fundingYieldService.calculate()) {
             WatchCoin coin = basket.get(yield.symbol());
             if (coin == null) {
                 continue;   // 只展示篮子里的币
             }
+            // 全历史年化：用库里从最早记录到现在的全部数据算（正负累加），与短窗口对照
+            BigDecimal allNetPct = null;
+            Long allDays = null;
+            FundingRateStat all = allStats.get(yield.symbol());
+            if (all != null && all.getSampleCount() != null && all.getSampleCount() > 0
+                    && all.getFirstTime() != null && all.getLastTime() != null) {
+                BigDecimal perYear = BigDecimal.valueOf(365L * 24)
+                        .divide(BigDecimal.valueOf(yield.intervalHours()), 10, RoundingMode.HALF_UP);
+                BigDecimal avgRate = all.getRateSum()
+                        .divide(BigDecimal.valueOf(all.getSampleCount()), 18, RoundingMode.HALF_UP);
+                BigDecimal allGrossPct = avgRate.multiply(perYear)
+                        .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+                allNetPct = allGrossPct.subtract(yield.feeDragAnnualizedPct()).setScale(2, RoundingMode.HALF_UP);
+                allDays = Duration.between(all.getFirstTime(), all.getLastTime()).toDays();
+            }
             result.add(new CandidateView(yield.symbol(), coin.getBaseCoin(), yield.intervalHours(),
                     yield.sampleCount(), yield.grossAnnualizedPct(), yield.feeDragAnnualizedPct(),
-                    yield.netAnnualizedPct(), turnover.get(yield.symbol()), coin.getDiscountRate()));
+                    yield.netAnnualizedPct(), turnover.get(yield.symbol()), coin.getDiscountRate(),
+                    allNetPct, allDays));
         }
         result.sort((a, b) -> b.netAnnualizedPct().compareTo(a.netAnnualizedPct()));
         return result;
     }
 
     /**
-     * 当前生效的参数（只读展示）。
-     *
-     * @return 配置键 → 值
+     * 后台"当前参数"页要展示的配置项：配置键 →（中文名称、说明）。顺序即页面顺序。
+     * 只列非密钥项，密码类永远不进后台。
      */
-    public Map<String, Object> params() {
-        String[] keys = {
-                "strategy.enabled", "strategy.allow-real-trading", "strategy.entry-net",
-                "strategy.switch-gap", "strategy.max-holdings", "strategy.max-single-weight",
-                "strategy.lookback-days", "strategy.recovery-filter", "strategy.target-invest-ratio",
-                "execution.price-buffer", "execution.leg-tolerance", "execution.order-timeout-ms",
-                "execution.max-retries", "risk.max-drawdown", "risk.mgn-ratio-warn", "risk.mgn-ratio-reduce",
-                "watch-coin.min-turnover", "watch-coin.min-discount-rate",
-                "simulation.enabled", "simulation.initial-usdt", "simulation.maintenance-margin-rate",
-                "collector.history-interval-ms", "collector.current-interval-ms",
-                "funding-yield.lookback-days", "funding-yield.rotation-days",
-                "funding-yield.spot-taker-fee-rate", "funding-yield.perp-taker-fee-rate",
-                "alert.mail.enabled", "bitget.paptrading"
-        };
-        Map<String, Object> result = new LinkedHashMap<>();
-        for (String key : keys) {
-            result.put(key, environment.getProperty(key));
+    private static final Map<String, ParamMeta> PARAM_META = new LinkedHashMap<>();
+
+    static {
+        PARAM_META.put("strategy.enabled", new ParamMeta("策略总开关", "false = 只评估、永不下单"));
+        PARAM_META.put("strategy.allow-real-trading", new ParamMeta("允许实盘下单", "实盘模式下的二次确认闸"));
+        PARAM_META.put("strategy.entry-net", new ParamMeta("建仓门槛（净年化）", "低于此值宁可空仓"));
+        PARAM_META.put("strategy.switch-gap", new ParamMeta("换仓门槛（领先幅度）", "候选比最差持仓高出多少才换"));
+        PARAM_META.put("strategy.max-holdings", new ParamMeta("最大持仓数", "最多同时持有几个币"));
+        PARAM_META.put("strategy.max-single-weight", new ParamMeta("单币仓位上限", "占总资金的比例"));
+        PARAM_META.put("strategy.lookback-days", new ParamMeta("策略窗口（天）", "综合费率窗口，窗口内正负累加"));
+        PARAM_META.put("strategy.recovery-filter", new ParamMeta("恢复轮数过滤", "要求连续为正轮数 > 历史平均恢复轮数"));
+        PARAM_META.put("strategy.target-invest-ratio", new ParamMeta("目标投入比例", "留余量做保证金缓冲"));
+        PARAM_META.put("execution.price-buffer", new ParamMeta("限价缓冲", "限价 = 对手价 ± 该比例"));
+        PARAM_META.put("execution.leg-tolerance", new ParamMeta("两腿容差", "名义价值偏差超过则补小腿"));
+        PARAM_META.put("execution.order-timeout-ms", new ParamMeta("下单超时（毫秒）", "超时撤单、重新取盘口重下"));
+        PARAM_META.put("execution.max-retries", new ParamMeta("最大重下次数", "超时后重新下单的次数上限"));
+        PARAM_META.put("risk.max-drawdown", new ParamMeta("最大回撤止损", "权益从峰值回撤超过则熔断"));
+        PARAM_META.put("risk.mgn-ratio-warn", new ParamMeta("保证金率预警线", "mgnRatio = mmr ÷ effEquity"));
+        PARAM_META.put("risk.mgn-ratio-reduce", new ParamMeta("保证金率减仓线", "达到则主动减仓"));
+        PARAM_META.put("watch-coin.min-turnover", new ParamMeta("币种池成交额下限", "24h 成交额（USDT）低于此不进池"));
+        PARAM_META.put("watch-coin.min-discount-rate", new ParamMeta("币种池折扣率下限", "保证金折扣率低于此不进池"));
+        PARAM_META.put("simulation.enabled", new ParamMeta("自建 mock 开关", "true = 行情读真实接口、下单本地模拟"));
+        PARAM_META.put("simulation.initial-usdt", new ParamMeta("模拟初始资金", "USDT，仅首次初始化生效"));
+        PARAM_META.put("simulation.maintenance-margin-rate", new ParamMeta("模拟维持保证金率", "算 mgnRatio 用的假设值"));
+        PARAM_META.put("collector.history-interval-ms", new ParamMeta("历史费率采集间隔", "毫秒"));
+        PARAM_META.put("collector.current-interval-ms", new ParamMeta("实时费率采集间隔", "毫秒"));
+        PARAM_META.put("funding-yield.lookback-days", new ParamMeta("展示窗口（天）", "后台收益率展示口径"));
+        PARAM_META.put("funding-yield.rotation-days", new ParamMeta("换仓轮换天数", "估算换仓成本用"));
+        PARAM_META.put("funding-yield.spot-taker-fee-rate", new ParamMeta("现货吃单费率", "成本模型输入"));
+        PARAM_META.put("funding-yield.perp-taker-fee-rate", new ParamMeta("合约吃单费率", "成本模型输入"));
+        PARAM_META.put("alert.mail.enabled", new ParamMeta("邮件告警开关", "熔断/异常是否发邮件"));
+        PARAM_META.put("bitget.paptrading", new ParamMeta("Bitget 模拟盘开关", "仅非 mock 模式下生效"));
+    }
+
+    /**
+     * 当前生效的参数（只读展示），带中文名称与说明，方便后台阅读。
+     *
+     * @return 参数列表（顺序与 {@link #PARAM_META} 一致）
+     */
+    public List<ParamView> params() {
+        List<ParamView> result = new ArrayList<>();
+        for (Map.Entry<String, ParamMeta> entry : PARAM_META.entrySet()) {
+            ParamMeta meta = entry.getValue();
+            result.add(new ParamView(entry.getKey(), meta.label(),
+                    formatValue(environment.getProperty(entry.getKey(), Object.class)), meta.note()));
         }
         return result;
+    }
+
+    /**
+     * 把配置值转成便于阅读的字符串。
+     *
+     * <p>踩过的坑：YAML 里的 {@code 0.0006} 会被解析成 Double，直接 {@code toString()} 会变成
+     * 科学计数法 {@code 6.0E-4}；这里用 {@link BigDecimal#toPlainString()} 还原成 {@code 0.0006}。
+     *
+     * @param raw 原始配置值
+     * @return 展示用的字符串；入参为 null 时返回 null
+     */
+    private static String formatValue(Object raw) {
+        if (raw == null) {
+            return null;
+        }
+        if (raw instanceof Number number) {
+            // stripTrailingZeros 去掉 Double 带出来的尾零（0.0006 会变成 "6.0E-4" → "0.00060"），
+            // 再用 toPlainString 保证不会输出科学计数法
+            return new BigDecimal(number.toString()).stripTrailingZeros().toPlainString();
+        }
+        return String.valueOf(raw);
     }
 
     /** @return 最近的事件日志（新的在前） */
@@ -332,6 +403,26 @@ public class DashboardService {
     public record CandidateView(String symbol, String baseCoin, int intervalHours, int sampleCount,
                                 BigDecimal grossAnnualizedPct, BigDecimal feeDragPct,
                                 BigDecimal netAnnualizedPct, BigDecimal turnover24h,
-                                BigDecimal discountRate) {
+                                BigDecimal discountRate, BigDecimal allNetAnnualizedPct, Long allDays) {
+    }
+
+    /**
+     * 参数的展示元信息。
+     *
+     * @param label 中文名称
+     * @param note  一句话说明（这个参数是干什么的）
+     */
+    private record ParamMeta(String label, String note) {
+    }
+
+    /**
+     * 一个参数的展示视图。
+     *
+     * @param key   配置键（如 strategy.entry-net）
+     * @param label 中文名称
+     * @param value 当前生效的值
+     * @param note  说明
+     */
+    public record ParamView(String key, String label, String value, String note) {
     }
 }

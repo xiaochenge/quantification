@@ -53,6 +53,26 @@ public interface FundingRateHistoryMapper {
     List<FundingRateStat> summarizeSince(@Param("from") LocalDateTime from);
 
     /**
+     * 按币种聚合<b>全部历史</b>的资金费率（不限时间窗口），用于后台"全历史年化"列。
+     *
+     * <p>口径与 {@link #summarizeSince} 一致（正负累加），只是不加时间过滤，
+     * 让长期表现可以和第 10 天 / 90 天窗口对照着看。
+     *
+     * @return 每个币种一条统计结果
+     */
+    @Select("""
+            SELECT symbol,
+                   COUNT(*)          AS sample_count,
+                   SUM(funding_rate) AS rate_sum,
+                   MIN(funding_time) AS first_time,
+                   MAX(funding_time) AS last_time
+            FROM funding_rate_history
+            GROUP BY symbol
+            ORDER BY symbol
+            """)
+    List<FundingRateStat> summarizeAll();
+
+    /**
      * 取某个币种已入库的<b>最新结算时间</b>。
      *
      * <p>增量采集用它做"从新到旧翻页、碰到它即停"的锚点：接口按结算时间从新到旧返回，

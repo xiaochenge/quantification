@@ -15,6 +15,13 @@ spring:
     name: quantification
   profiles:
     active: local
+  # 后台静态页（index.html / app.js）不做浏览器缓存：否则改完前端后，
+  # 浏览器一直用旧 app.js，会出现"接口已是新格式、页面还是旧样式"的假象。
+  web:
+    resources:
+      cache:
+        cachecontrol:
+          no-store: true
   # 从仓库外加载密钥文件。optional 表示文件缺失时仍能启动（会打印告警）；
   # 环境变量优先级高于配置文件，所以 DB_PASSWORD 等仍可覆盖。
   config:
@@ -134,6 +141,13 @@ simulation:
   funding-settle-interval-ms: 60000 # 资金费结算扫描间隔（结算点数据来自历史费率表，幂等）
   snapshot-initial-delay-ms: 30000  # 启动 30 秒后记第一条净值
   snapshot-interval-ms: 3600000     # 之后每小时记一条（净值曲线 / 滚动年化的数据源）
+
+# 主机资源监控（模块 10 后台"机器监控"页）：采集这台机器的 CPU / 内存 / 磁盘 / 负载，画历史曲线。
+# 数据来自 JVM 自带 MXBean + 文件系统容量查询，不启子进程，开销可忽略。
+host-monitor:
+  initial-delay-ms: 20000        # 启动 20 秒后采第一条
+  sample-interval-ms: 60000      # 每 1 分钟采一条（90 天约 13 万行，很小）
+  disk-path: /                   # 监控哪个路径所在磁盘的容量
 
 # 风控（模块 6）
 risk:

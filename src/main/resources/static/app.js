@@ -22,6 +22,8 @@ const app = createApp({
     const params = ref([]);
     const curve = ref([]);
     const pnl = ref(null);
+    const host = ref(null);
+    const hostHistory = ref([]);
     const tradeTab = ref('fills');
 
     // 候选池单币费率曲线弹窗
@@ -31,21 +33,25 @@ const app = createApp({
 
     let equityChart = null;
     let frChart = null;
+    let hostCpuChart = null;
+    let hostMemChart = null;
 
     async function loadLight() {
       try {
-        const [ov, pos, ev, cv, pl] = await Promise.all([
+        const [ov, pos, ev, cv, pl, hs] = await Promise.all([
           api.get('/api/admin/overview'),
           api.get('/api/admin/positions'),
           api.get('/api/admin/events?limit=100'),
           api.get('/api/admin/equity-curve?limit=1000'),
           api.get('/api/admin/pnl'),
+          api.get('/api/admin/host'),
         ]);
         overview.value = ov.data;
         positions.value = pos.data;
         events.value = ev.data;
         curve.value = cv.data;
         pnl.value = pl.data;
+        host.value = hs.data;
         renderEquity();
       } catch (e) {
         console.error('刷新失败', e);
@@ -54,29 +60,39 @@ const app = createApp({
 
     async function loadHeavy() {
       try {
-        const [cd, od, fl, fi, pr] = await Promise.all([
+        const [cd, od, fl, fi, pr, hh] = await Promise.all([
           api.get('/api/admin/candidates'),
           api.get('/api/admin/orders?limit=100'),
           api.get('/api/admin/fills?limit=100'),
           api.get('/api/admin/funding-income?limit=100'),
           api.get('/api/admin/params'),
+          api.get('/api/admin/host-history?limit=1000'),
         ]);
         candidates.value = cd.data;
         orders.value = od.data;
         fills.value = fl.data;
         fundingIncome.value = fi.data;
-        params.value = Object.entries(pr.data).map(([k, v]) => ({ key: k, value: v }));
+        params.value = pr.data;
+        hostHistory.value = hh.data;
+        renderHost();
       } catch (e) {
         console.error('刷新失败', e);
       }
     }
 
     function renderEquity() {
-      if (!curve.value || !curve.value.length) return;
       nextTick(() => {
         const el = document.getElementById('equity-chart');
         if (!el) return;
+        // 说明：图表容器写在 v-if 里，切到别的菜单时它会被销毁、切回来会新建一个节点。
+        // 旧的 ECharts 实例仍指向已被移除的 DOM，直接 setOption 会画不出来（页面空白），
+        // 所以容器一变就销毁重建。
+        if (equityChart && equityChart.getDom() !== el) {
+          equityChart.dispose();
+          equityChart = null;
+        }
         if (!equityChart) equityChart = echarts.init(el);
+        if (!curve.value || !curve.value.length) return;
         const rows = curve.value.slice().reverse(); // 时间升序
         equityChart.setOption({
           tooltip: { trigger: 'axis' },
@@ -92,6 +108,64 @@ const app = createApp({
       });
     }
 
+    // 字节 → 人类可读：小于 1GB 显示 MB，否则显示 GB
+    function gb(bytes) {
+      if (bytes == null) return '-';
+      const b = Number(bytes);
+      if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(0) + ' MB';
+      return (b / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+    }
+    function ratioPct(used, total) {
+      if (used == null || total == null || Number(total) <= 0) return '-';
+      return (Number(used) / Number(total) * 100).toFixed(1) + '%';
+    }
+    function memPct() { return host.value ? ratioPct(host.value.memUsedBytes, host.value.memTotalBytes) : '-'; }
+    function diskPct() { return host.value ? ratioPct(host.value.diskUsedBytes, host.value.diskTotalBytes) : '-'; }
+
+    function renderHost() {
+      nextTick(() => {
+        const rows = (hostHistory.value || []).slice().reverse(); // 时间升序
+        const x = rows.map(r => (r.sampledAt || '').replace('T', ' ').slice(5, 16));
+
+        const cpuEl = document.getElementById('host-cpu-chart');
+        if (cpuEl) {
+          // 和收益曲线同理：容器在 v-if 里会被销毁重建，实例节点变了要重新初始化
+          if (hostCpuChart && hostCpuChart.getDom() !== cpuEl) { hostCpuChart.dispose(); hostCpuChart = null; }
+          if (!hostCpuChart) hostCpuChart = echarts.init(cpuEl);
+          hostCpuChart.setOption({
+            tooltip: { trigger: 'axis' },
+            legend: { data: ['整机 CPU', '本进程 CPU'] },
+            grid: { left: 50, right: 20, top: 40, bottom: 40 },
+            xAxis: { type: 'category', data: x },
+            yAxis: { type: 'value', max: 100, axisLabel: { formatter: '{value}%' } },
+            series: [
+              { name: '整机 CPU', type: 'line', smooth: true, showSymbol: false, data: rows.map(r => r.cpuLoadPct) },
+              { name: '本进程 CPU', type: 'line', smooth: true, showSymbol: false, data: rows.map(r => r.processCpuLoadPct) },
+            ],
+          });
+        }
+
+        const memEl = document.getElementById('host-mem-chart');
+        if (memEl) {
+          if (hostMemChart && hostMemChart.getDom() !== memEl) { hostMemChart.dispose(); hostMemChart = null; }
+          if (!hostMemChart) hostMemChart = echarts.init(memEl);
+          hostMemChart.setOption({
+            tooltip: { trigger: 'axis' },
+            legend: { data: ['内存使用率', '磁盘使用率'] },
+            grid: { left: 50, right: 20, top: 40, bottom: 40 },
+            xAxis: { type: 'category', data: x },
+            yAxis: { type: 'value', max: 100, axisLabel: { formatter: '{value}%' } },
+            series: [
+              { name: '内存使用率', type: 'line', smooth: true, showSymbol: false,
+                data: rows.map(r => r.memTotalBytes ? Number((r.memUsedBytes / r.memTotalBytes * 100).toFixed(1)) : null) },
+              { name: '磁盘使用率', type: 'line', smooth: true, showSymbol: false,
+                data: rows.map(r => r.diskTotalBytes ? Number((r.diskUsedBytes / r.diskTotalBytes * 100).toFixed(1)) : null) },
+            ],
+          });
+        }
+      });
+    }
+
     async function showFundingRate(symbol) {
       frSymbol.value = symbol;
       frDialog.value = true;
@@ -101,6 +175,11 @@ const app = createApp({
         nextTick(() => {
           const el = document.getElementById('fr-chart');
           if (!el) return;
+          // 弹窗关闭再打开时节点会重建，同样需要重新初始化，否则第二次打开是空白
+          if (frChart && frChart.getDom() !== el) {
+            frChart.dispose();
+            frChart = null;
+          }
           if (!frChart) frChart = echarts.init(el);
           const rows = frHistory.value.slice().reverse(); // 时间升序
           frChart.setOption({
@@ -142,10 +221,13 @@ const app = createApp({
       window.addEventListener('resize', () => {
         if (equityChart) equityChart.resize();
         if (frChart) frChart.resize();
+        if (hostCpuChart) hostCpuChart.resize();
+        if (hostMemChart) hostMemChart.resize();
       });
     });
     watch(active, (v) => {
       if (v === 'curve') nextTick(renderEquity);
+      if (v === 'host') nextTick(renderHost);
     });
     onBeforeUnmount(() => {
       clearInterval(lightTimer);
@@ -154,8 +236,8 @@ const app = createApp({
 
     return {
       active, loading, overview, positions, candidates, orders, fills, fundingIncome,
-      events, params, curve, pnl, frDialog, frSymbol, frHistory, tradeTab,
-      pct, money, num, showFundingRate, levelTag, statusText, statusType,
+      events, params, curve, pnl, host, hostHistory, frDialog, frSymbol, frHistory, tradeTab,
+      pct, money, num, gb, memPct, diskPct, showFundingRate, levelTag, statusText, statusType,
     };
   },
 
@@ -170,6 +252,7 @@ const app = createApp({
         <el-menu-item index="candidates">候选池</el-menu-item>
         <el-menu-item index="trades">成交与订单</el-menu-item>
         <el-menu-item index="curve">收益曲线</el-menu-item>
+        <el-menu-item index="host">机器监控</el-menu-item>
         <el-menu-item index="events">异常与告警</el-menu-item>
         <el-menu-item index="params">当前参数</el-menu-item>
       </el-menu>
@@ -243,11 +326,17 @@ const app = createApp({
           <el-table-column prop="baseCoin" label="币种" width="100" />
           <el-table-column prop="symbol" label="交易对" width="140" />
           <el-table-column prop="intervalHours" label="周期(h)" width="80" />
-          <el-table-column prop="grossAnnualizedPct" label="毛年化" sortable><template #default="s">{{ s.row.grossAnnualizedPct }}%</template></el-table-column>
+          <el-table-column prop="grossAnnualizedPct" label="90天毛年化" sortable><template #default="s">{{ s.row.grossAnnualizedPct }}%</template></el-table-column>
           <el-table-column prop="feeDragPct" label="成本年化" sortable><template #default="s">{{ s.row.feeDragPct }}%</template></el-table-column>
-          <el-table-column prop="netAnnualizedPct" label="净年化" sortable><template #default="s">{{ s.row.netAnnualizedPct }}%</template></el-table-column>
+          <el-table-column prop="netAnnualizedPct" label="90天净年化" sortable><template #default="s">{{ s.row.netAnnualizedPct }}%</template></el-table-column>
           <el-table-column prop="discountRate" label="折扣率"><template #default="s">{{ s.row.discountRate ?? '-' }}</template></el-table-column>
           <el-table-column prop="turnover24h" label="24h成交额"><template #default="s">{{ s.row.turnover24h ? money(s.row.turnover24h) : '-' }}</template></el-table-column>
+          <el-table-column prop="allNetAnnualizedPct" label="全历史净年化" sortable>
+            <template #default="s">
+              <span v-if="s.row.allNetAnnualizedPct != null">{{ s.row.allNetAnnualizedPct }}%<span style="color:#8492a6;font-size:12px"> ({{ s.row.allDays }}天)</span></span>
+              <span v-else>-</span>
+            </template>
+          </el-table-column>
           <el-table-column label="操作" width="120">
             <template #default="s"><el-button size="small" @click="showFundingRate(s.row.symbol)">费率曲线</el-button></template>
           </el-table-column>
@@ -324,12 +413,45 @@ const app = createApp({
         </el-table>
       </div>
 
+      <!-- 机器监控 -->
+      <div v-else-if="active === 'host'">
+        <div class="card">
+          <h3 style="margin-top:0">机器监控（当前）</h3>
+          <div class="metric">
+            <div class="item"><div class="label">整机 CPU</div><div class="value">{{ host?.cpuLoadPct != null ? host.cpuLoadPct + '%' : '-' }}</div></div>
+            <div class="item"><div class="label">本进程 CPU</div><div class="value">{{ host?.processCpuLoadPct != null ? host.processCpuLoadPct + '%' : '-' }}</div></div>
+            <div class="item"><div class="label">CPU 核数</div><div class="value">{{ host?.cpuCores ?? '-' }}</div></div>
+            <div class="item"><div class="label">负载(1分钟)</div><div class="value">{{ host?.loadAverage ?? '-' }}</div></div>
+            <div class="item"><div class="label">内存</div><div class="value">{{ gb(host?.memUsedBytes) }} / {{ gb(host?.memTotalBytes) }}</div></div>
+            <div class="item"><div class="label">内存使用率</div><div class="value">{{ memPct() }}</div></div>
+            <div class="item"><div class="label">磁盘</div><div class="value">{{ gb(host?.diskUsedBytes) }} / {{ gb(host?.diskTotalBytes) }}</div></div>
+            <div class="item"><div class="label">磁盘使用率</div><div class="value">{{ diskPct() }}</div></div>
+            <div class="item"><div class="label">JVM 堆</div><div class="value">{{ gb(host?.heapUsedBytes) }} / {{ gb(host?.heapMaxBytes) }}</div></div>
+            <div class="item"><div class="label">交换区已用</div><div class="value">{{ gb(host?.swapUsedBytes) }}</div></div>
+          </div>
+          <div style="margin-top:8px;color:#8492a6;font-size:12px">
+            说明：macOS 会把空闲内存拿去做文件缓存，所以"内存使用率"接近 100% 属正常；判断内存是否吃紧看"交换区已用"是否持续增长。
+            功耗无法在 macOS 上以普通权限读取（需要 root 的 powermetrics），这里用 CPU 使用率与负载作为代理指标。
+          </div>
+        </div>
+        <div class="card">
+          <h4 style="margin-top:0">CPU 使用率历史（%）</h4>
+          <div id="host-cpu-chart" class="chart"></div>
+        </div>
+        <div class="card">
+          <h4 style="margin-top:0">内存 / 磁盘 使用率历史（%）</h4>
+          <div id="host-mem-chart" class="chart"></div>
+        </div>
+      </div>
+
       <!-- 当前参数 -->
       <div v-else-if="active === 'params'" class="card">
         <h3 style="margin-top:0">当前参数（只读）</h3>
         <el-table :data="params" stripe>
-          <el-table-column prop="key" label="配置项" min-width="260" />
-          <el-table-column prop="value" label="值" />
+          <el-table-column prop="label" label="名称" width="180" />
+          <el-table-column prop="key" label="配置项" min-width="220" />
+          <el-table-column prop="value" label="当前值" width="170" />
+          <el-table-column prop="note" label="说明" min-width="280" />
         </el-table>
       </div>
     </main>

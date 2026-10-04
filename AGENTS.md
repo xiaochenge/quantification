@@ -1,304 +1,402 @@
 # quantification 项目交接与约定
 
-> 这个文件会被 Codex 在每次新会话开始时自动读取。**新会话请先读这一份，再读 `docs/` 里的四份文档。**
-> 最后更新：2026-09-24
+> 本文件由 Codex 在每次新会话开始时自动读取。**新会话先读这一份，再读 `docs/` 下的文档。**
+> **本文档已按 2026-10-04 的实际代码逐项核对；与旧设计文档冲突时，以当前代码与本文档为准。**
+> 最后更新：2026-10-04
 
-## 项目是什么
+## 0. 三十秒速览
 
-资金费率套现（funding rate arbitrage）。**只在 Bitget 一家交易所**操作：同时监控多个币种，
-对费率处于高位的币种建立 **delta 中性仓位（现货多 + 永续空）** 吃资金费，按费率变化动态调仓。
+| 问题 | 答案 |
+| --- | --- |
+| 做什么 | Bitget 资金费率套现：**现货多 + 永续空（delta 中性）**吃资金费，按费率变化动态调仓 |
+| 做到哪了 | **一期（数据/策略/执行/风控/对账）全部完成**；自建 mock（模块 9）、管理后台（模块 10）、邮件告警、恢复轮数过滤都已落地 |
+| 现在在跑什么 | **自建 mock 长期验证**（初始 **3 万 USDT**），由 launchd 托管、防休眠，计划跑 3 个月 |
+| 用哪个模式 | **只走自建 mock**（`simulation.enabled=true`）。**Bitget 官方模拟盘（demo 账户）已弃用、不再使用**；实盘尚未启用 |
+| 下一步做什么 | **改「下单 / 换仓」逻辑**（见第 15 节）；以及模块 8 完整盈亏核算 |
 
-- 目标：**理想总体年化 8%**（弹性目标，非保底）；底线是"宁可空仓，也不亏钱"
-- 账户类型：**统一账户（UTA）**，走 `/api/v3` 接口
-- 上线节奏：先在**官方模拟盘**跑通流程，再考虑真实资金
+## 1. 项目是什么
 
-**权威设计文档是 `docs/` 下的四份**；本文件只记录环境、约定、进度和待办。
+Bitget 单交易所的资金费率套现策略：同时监控多个币种，对"10 天窗口净年化"达标的币建立
+**现货多 + 永续空**的 delta 中性仓位吃资金费，按费率变化动态调仓。
 
-部署形态：**当前这台 Mac mini 只作开发机**，将来另买一台 Mac mini 当服务器跑正式。
-代码要按"开发机开发验证、服务器跑正式"来写——配置靠 profile 区分，不写死本机路径。
+- 目标：**理想总体年化 8%**（弹性目标，非保底）；铁律是**宁可空仓，也不亏钱**
+- 账户类型：Bitget **统一账户（UTA）**，走 `/api/v3`
+- 权威设计文档：`docs/` 下的设计文档（但**以本文件与代码为准**）
 
-## 当前状态（里程碑：2026-09-24 · 自建 mock 已落地）
+## 2. 当前状态（里程碑 2026-10-04）
 
 ### ✅ 已完成
 
 | 部分 | 内容 |
 | --- | --- |
-| **数据层（模块 1、2）** | Flyway 迁移 V1~V5（16 张表）；自建 Bitget 客户端（公共 + 私有，含签名、模拟盘开关、网络重试） |
-| **采集** | 篮子自动同步（成交额 ≥500 万 + 折扣率 ≥0.8 + 现货/合约都有）、历史/实时资金费率、交易对规则、真实手续费率 |
-| **策略层（模块 3~5）** | 费率分析（10 天窗口净年化）、持仓决策、FOK 下单 + 成交反查 + 补单/回退 |
-| **风控（模块 6）** | 回撤熔断、保证金率预警、轻量失败不熔断（只跳过） |
-| **对账（模块 7）** | 启动时以交易所为准接管持仓 |
-| **自建 mock（模块 9）** | `ExchangeGateway` 双实现（Real / Mock）；按真实盘口撮合并记滑点；模拟账本落库（`trade_order` / `trade_fill` / `mock_account` / `mock_position`）；**资金费自己算**；净值曲线 + 只读接口 |
-| **安全加固** | 密钥移出仓库到 `~/.quantification/`，构建 + 提交双重校验 |
-| **需求设计** | 二阶段 10 个模块全部定稿（见 `docs/phase-2-strategy-design.md`） |
+| **数据层（模块 1、2）** | Flyway `V1`~`V8`，**18 张业务表**；自建 Bitget 客户端（公共 + 私有，签名 / 模拟盘开关 / 网络重试） |
+| **采集** | 篮子自动同步（成交额 ≥500 万 + 折扣率 ≥0.8）、历史费率（**每 1 小时**增量补采）、实时费率（每 10 分钟）、交易对规则（每小时）、真实手续费率（每天，非 mock） |
+| **策略（模块 3、4）** | 10 天窗口净年化排序、**恢复轮数过滤**（已实现）、目标仓位与权重（成交额加权、单币 ≤40%、总投入 ≤95%） |
+| **执行（模块 5）** | FOK 限价单 + 盘口深度定量 + **成交反查** + 补单 / 回退（两腿纪律） |
+| **风控（模块 6）** | 回撤熔断、保证金率预警/减仓、**熔断分级**（网络类异常不熔断只重试）、邮件告警 |
+| **对账（模块 7）** | 启动时以交易所为准接管持仓；**孤儿仓位**（掉出篮子但仍持仓）会被自动平掉 |
+| **自建 mock（模块 9）** | `ExchangeGateway` 双实现；按真实盘口撮合、记滑点与手续费；模拟账本落库；**资金费自己按真实费率×真实仓位结算**；平仓前补拉费率防漏结 |
+| **管理后台（模块 10）** | 免登录只读看板（Vue3 + Element Plus + ECharts，由 Spring Boot 静态托管），7 个页面 + 机器监控 |
+| **事件留痕** | `event_log` 表记录熔断 / 邮件 / 下单失败 / 对账接管 |
+| **安全加固** | 密钥在仓库外 `~/.quantification/application-local.yml`；构建 + 提交双重校验 |
 
-### 🔄 进行中
+### 🔄 当前在跑
 
-**官方模拟盘流程验证**（用 BTC 测整个链路）。已查明模拟盘的关键限制（见下"模拟盘实测结论"）。
-**收益验证改走自建 mock**（`simulation.enabled=true`），它已能跑完整候选池。
+- **模式**：自建 mock（`simulation.enabled=true`）。
+- **资金**：初始 3 万 USDT（`simulation.initial-usdt`），第一期拟投入规模。
+- **托管**：launchd（`~/Library/LaunchAgents/com.quantification.app.plist`）：开机自启 + 崩溃自动重启 + 日志落 `logs/app.out.log`。
+- **防休眠**：`com.quantification.nosleep`（caffeinate -i -s），Mac 不会休眠导致程序冻结。
+- **数据库**：MySQL 由 `com.quantification.mysql` 托管，开机自启。
+- 长期目标：连续跑 **≥3 个月**、滚动年化 ≥8%、最大回撤 ≤5%。
 
 ### ⏳ 未完成
 
 | 项 | 说明 |
 | --- | --- |
-| 盈亏核算（模块 8） | 未实现 |
-| 管理后台（模块 10） | 未实现（技术选型已定：Spring 只读 REST + Vue3/Element Plus/ECharts） |
-| 邮件告警 | 配置项已留，**发送逻辑未实现** |
-| 费率恢复轮数过滤 | 回测里有，**策略代码里还没加** |
-| 订单/成交落库 | **mock 路径已落库**（`trade_order` / `trade_fill`）；实盘路径还没接"反查订单 → 更新本地状态机" |
-| 下架监控 | 监听公告，持仓币种下架时平仓（一期人工，二期自动） |
-| `mgnRatio` 口径 | 已实测确认 = `mmr ÷ effEquity`，但预警/减仓阈值尚未落地 |
+| **盈亏核算（模块 8）** | 只做了**最小版**：`/api/admin/pnl` 给出"资金费 − 手续费 + 现货/永续已实现 + 未实现 + 残差"的分解。完整口径（按"一组策略仓位"结算、滚动 7/30/90 天年化、单币+组合归因、闲钱活期基准）**未做** |
+| `strategy_position` 表 | 已建表但**还没写入**（属于模块 8） |
+| 实盘路径的订单落库 | `trade_order` / `trade_fill` 目前只由 mock 写；实盘路径还没接"反查订单 → 更新本地状态机" |
+| 下架监控 | 监听公告、持仓币种下架时平仓（一期人工） |
+| 若干配置项未接线 | 见第 11 节 |
 
-## 技术栈与版本
+## 3. 运行模式与交易所接入（最重要的一节）
+
+### 3.1 三种模式 `TradeMode`
+
+代码位置：`exchange/TradeMode.java`、`exchange/ExchangeGateway.java`。
+
+| 模式 | 说明 | 当前是否使用 |
+| --- | --- | --- |
+| `REAL` | 实盘，真钱真单；需 `strategy.allow-real-trading=true` 这道闸 | ❌ 未启用 |
+| `DEMO` | **Bitget 官方模拟盘**（`bitget.paptrading=true` + demo 密钥 + `paptrading:1` 头） | ❌ **已弃用** |
+| `MOCK` | **自建 mock**（`simulation.enabled=true`）：行情读真实接口、下单本地模拟 | ✅ **当前模式** |
+
+### 3.2 为什么弃用官方模拟盘（DEMO）
+
+实测结论（2026-09-23/24）：
+
+- **覆盖太小**：现货 25 个、合约 45 个，真实币交集只有 **BTC/ETH/DOGE/SOL**；
+- **现货报价部分是坏的**：ETH 卖一 54500（真实 2726）、SOL 偏离 55% → 代码会自动识别并标记为模拟盘不可交易；
+- **资金费金额口径不可信**：2026-09-24 08:00 实际到账 +0.4749，而按"名义 18958 × 费率 0.000068"应得 1.289，差 **2.7 倍**；
+- 另有 **±2% 限价风控**（偏离市价超 2% 直接拒单，`25206`）。
+
+结论：官方模拟盘只能验证"程序链路"，**不能验证策略收益**。收益验证改由自建 mock 承担。
+代码里 `RealExchangeGateway`（含 DEMO）仍然保留，但**不再使用**。
+
+### 3.3 自建 mock 的行为（`exchange/MockExchangeGateway`）
+
+- **读真实**：行情 / 费率 / 盘口 / 折扣率 / 交易对规则全部走 Bitget 公共接口（`BitgetPublicClient`）；该客户端**已接网络重试**（`HttpRetry`，只重试 IO 类异常）。
+- **本地撮合**：`MatchEngine` 从真实订单簿逐档吃单算成交均价与滑点；限价 FOK 吃不下就整笔撤销；精度 / 余额 / 保证金不足一律拒单（模拟 `40808` / `25202`）。
+- **本地账本**：现金存 `mock_account`、持仓存 `mock_position`（**重启从表恢复**，不重置收益）。
+- **资金费自己算**：真实费率 × 真实仓位 → `funding_income`（唯一键 `(source, symbol, settlement_time)` 幂等，重启不重复入账）；**平仓前会补拉该币最近费率**，避免"币掉出篮子后最后一段结算点没采到"导致漏结。
+- **成交落库**：`trade_order` + `trade_fill`（`source=mock`），含滑点、手续费、两条腿的已实现盈亏。
+- **安全边界**：该类**不注入** `BitgetPrivateClient`，从设计上不可能发出真实交易请求。
+- **与实盘有意的差异**（简化）：① 平仓数量超持仓按"减到零"处理（实盘会拒单）；② 开空保证金按 1 倍有效担保粗算；③ 维持保证金率用 `simulation.maintenance-margin-rate` 固定假设；④ 资金费名义值用结算时刻最新价近似。
+
+### 3.4 两道安全闸（防误下真单）
+
+1. `strategy.enabled=false` → 只评估、永不下单；
+2. `strategy.allow-real-trading=false`（默认）→ 即使模式是 `REAL`，也只在日志里打印"本应下单"，不下单。
+
+模式是 `MOCK` 或 `DEMO` 时不需要第二道闸（本来就不动真实资金）。
+
+## 4. 怎么运行 / 运维
+
+### 4.1 打包与启动
+
+```bash
+./mvnw clean test                      # 提交前必须通过（13 个单测）
+./mvnw -DskipTests package             # 打成可执行 jar：target/quantification-1.0-SNAPSHOT.jar
+```
+
+**正式（当前用法，launchd 托管，开机自启 + 崩溃自愈）**：
+
+```bash
+cp deploy/com.quantification.app.plist ~/Library/LaunchAgents/          # 路径按机器改
+launchctl load  ~/Library/LaunchAgents/com.quantification.app.plist
+launchctl unload ~/Library/LaunchAgents/com.quantification.app.plist    # 停止
+launchctl list | grep quantification                                    # 看状态
+tail -f logs/app.out.log logs/app.err.log                               # 看日志
+```
+
+**临时前台跑**：`./mvnw spring-boot:run`。
+**改了代码后要让改动生效**：重新 `package` → `launchctl unload` + `load`（重启后 mock 状态从数据库恢复，不丢数据）。
+
+### 4.2 管理后台
+
+浏览器打开 **`http://localhost:8080`**（免登录、只读）。静态页由 Spring Boot 托管
+（`src/main/resources/static/`），**已配置 `Cache-Control: no-store`**，改前端后浏览器不会吃到旧缓存。
+
+### 4.3 远程运维（Windows → Mac）
+
+已配好：**Tailscale**（Mac 的地址形如 `100.69.19.17`）+ macOS 自带**屏幕共享**（VNC，5900）+ **远程登录**（SSH，22）。
+
+- Windows 侧装 Tailscale（同账号）+ 任意 VNC 客户端（RealVNC Viewer / TightVNC），连 `100.x.x.x:5900`；
+- 或直接 `ssh chenwu@100.x.x.x` 做命令行运维；
+- **建议配一个 HDMI 虚拟显示器诱骗器**（dummy plug），否则无头 Mac 的远程桌面分辨率会很低。
+
+### 4.4 启动后的时间线
+
+3s 篮子同步 → 5s 实时费率 → 8s 历史费率 → 10s 交易对规则 → 15s 费率采集 →
+20s 策略首次评估 + 主机监控首次采样 → 之后每小时评估 + 每小时净值快照、每 1 分钟主机采样、
+每 1 分钟资金费结算扫描。
+
+## 5. 技术栈
 
 | 项目 | 实际使用 |
 | --- | --- |
-| JDK | 24（`~/Library/Java/JavaVirtualMachines/openjdk-24.0.2+12-54`） |
+| JDK | **24**（`~/Library/Java/JavaVirtualMachines/openjdk-24.0.2+12-54`，launchd 里用绝对路径） |
 | 构建 | Maven 3.9.16，项目自带 `./mvnw` |
-| 框架 | **Spring Boot 4.1.1**（parent） |
-| 持久层 | **MyBatis 4.1.0**（原生 Mapper，注解 SQL） |
-| 数据库 | **MySQL 8.4.11**，已装在 `~/Library/MySQL`，监听 `127.0.0.1:3306` |
-| 结构迁移 | **Flyway 12.4.0**（`spring-boot-starter-flyway` + `flyway-mysql`） |
+| 框架 | **Spring Boot 4.1.1**（`spring-boot-starter-web` / `-flyway` / **`-mail`** / `-test`） |
+| 持久层 | **MyBatis 4.1.0**（原生 Mapper，注解 SQL，`map-underscore-to-camel-case`） |
+| 数据库 | **MySQL 8.4.11**（`~/Library/MySQL`，只监听 `127.0.0.1:3306`），库 `quantification_test` / `quantification_prod`，账号 `quant_app` |
+| 结构迁移 | **Flyway 12.4.0**（`V1`~`V8`） |
 | JSON | Jackson 3（databind 在 `tools.jackson`，注解仍是 `com.fasterxml.jackson.annotation`） |
-| 交易所 | **自建轻量客户端**（不引官方 SDK——它没发布到 Maven 且依赖太旧），见下方说明 |
-| 前端 | Vue 3 + Element Plus + ECharts（未开工） |
+| 交易所接入 | **自建轻量客户端**（不引官方 SDK：未发布到 Maven 且 Java 8 老依赖，JDK 24 编译不了） |
+| 前端 | **Vue 3 + Element Plus + ECharts**，CDN 引入、**免构建**（无 node 依赖），静态托管 |
+| 主机监控 | JDK `com.sun.management.OperatingSystemMXBean`（CPU/内存）+ `File` 容量（磁盘）+ `sysctl vm.swapusage`（macOS 交换区） |
 
-### 为什么不用 Bitget 官方 Java SDK
-
-官方 SDK 没发布到任何 Maven 仓库（Central / Sonatype 均 404），且是 Java 8 + 老依赖
-（lombok 1.16.20、fastjson 1.2.70），在 JDK 24 上无法编译。**改用 Spring 自带的 `RestClient`
-直接调 REST 接口**，签名逻辑自行实现（参考官方文档）。
-
-## 代码结构（实际）
+## 6. 代码结构（实际）
 
 ```
 com.quantification
-├── Application          启动类（@SpringBootApplication + @EnableScheduling + @MapperScan）
-├── admin                接口层：CollectController（手动触发采集）、FundingYieldController
-├── bitget               交易所客户端
-│   ├── BitgetPublicClient   公共接口（行情/费率/盘口/折扣率/交易对规则），含模拟盘变体
-│   ├── BitgetPrivateClient  私有接口（账户/持仓/下单/撤单/查单/费率），含签名与模拟盘开关
-│   └── HttpRetry            网络抖动重试（只重试 IO 异常，业务错误不重试）
-├── entity               实体（与表一一对应）
-├── mapper               MyBatis Mapper
-└── service              业务层
-    ├── WatchCoinService      篮子同步（成交额 + 折扣率 + 模拟盘报价校验）
-    ├── InstrumentService     交易对规则同步（精度/最小最大/乘数落库）
-    ├── FundingRateService    历史/实时资金费率采集
-    ├── FeeRateService        账户真实手续费率采集
-    ├── FundingAnalysisService 费率分析（窗口净年化，候选排序）
-    ├── FundingYieldService   收益率展示（后台用，支持 /api/admin/funding-yield）
-    ├── StrategyService       决策（目标仓位）
-    ├── OrderExecutionService 执行（FOK + 成交反查 + 补单/回退）
-    ├── RiskService           熔断与风险指标
-    └── TradingLoopService    交易循环编排（含决策日志、启动对账）
+├── Application                启动类（@SpringBootApplication + @EnableScheduling + @MapperScan）
+├── admin                      只读接口层
+│   ├── DashboardController        后台看板接口（见第 9 节）
+│   ├── SimulationController       模拟盘查询/调试（/api/admin/simulation/*）
+│   ├── CollectController          手动触发采集（/api/admin/collect/*）
+│   ├── FundingYieldController     收益率展示（/api/admin/funding-yield）
+│   └── AlertController            发测试告警邮件（/api/admin/alert/test）
+├── bitget                     交易所底层客户端
+│   ├── BitgetPublicClient         公共接口（行情/费率/盘口/折扣率/交易对规则），含模拟盘变体，**带 HttpRetry**
+│   ├── BitgetPrivateClient        私有接口（账户/持仓/下单/撤单/查单/费率），含签名与模拟盘开关
+│   ├── BitgetApiException         业务异常
+│   └── HttpRetry                  网络抖动重试（只重试 IO 异常）
+├── exchange                   **交易所网关层（模式隔离）**
+│   ├── ExchangeGateway            接口：assets / positions / 下单 / 撤单 / 查单 / 费率 / settleFunding
+│   ├── RealExchangeGateway        实盘 + 官方模拟盘实现（转发 BitgetPrivateClient；当前未用）
+│   ├── MockExchangeGateway        自建 mock（本地撮合 + 账本 + 资金费结算）★当前模式
+│   ├── MatchEngine                按真实盘口逐档撮合的纯算法（有单测）
+│   └── TradeMode                  REAL / DEMO / MOCK
+├── entity                     实体（与表一一对应）
+├── mapper                     MyBatis Mapper
+└── service                    业务层
+    ├── WatchCoinService           篮子同步（成交额 + 折扣率 + 模拟盘报价校验）
+    ├── InstrumentService          交易对规则同步（精度/最小最大/乘数落库）
+    ├── FundingRateService         历史/实时资金费率采集（历史增量"碰到已有即停"，不断档）
+    ├── FeeRateService             账户真实手续费率采集（**mock 模式跳过**）
+    ├── FundingAnalysisService     费率分析：10 天窗口净年化 + **恢复轮数过滤**
+    ├── FundingYieldService        收益率展示（90 天窗口，给后台"候选池"用）
+    ├── StrategyService            决策：候选 → 目标仓位（含恢复过滤、权重、单币上限）
+    ├── OrderExecutionService      执行：盘口定量 + FOK + 成交反查 + 补单/回退
+    ├── RiskService                熔断与风险指标（熔断会落 event_log + 发邮件）
+    ├── TradingLoopService         交易循环编排（决策日志、启动对账、孤儿仓位平仓）
+    ├── SimulationService          模拟盘账务：资金费结算调度、净值快照、查询
+    ├── DashboardService           后台数据装配（总览/持仓/候选池/参数/盈亏/事件）
+    ├── HostMonitorService         主机资源采样（CPU/内存/磁盘/负载/交换区）
+    ├── EventLogService            事件落库（熔断/邮件/下单失败/对账）
+    └── MailAlertService           邮件告警（SMTP，失败不抛异常、按主题节流）
 ```
 
-## 数据库
+## 7. 数据库（18 张表 · Flyway V8）
 
-装在本机内置盘，端口 3306 只监听 `127.0.0.1`：库 `quantification_test`（日常开发）、
-`quantification_prod`（本机演练），账号 `quant_app`。
-
-**已建 16 张**：`instrument`（交易对规则）、`watch_coin`（篮子 + 折扣率 + 模拟盘/实盘支持标记）、
-`funding_rate_history`、`funding_rate_current`、`ticker_snapshot`、`account_balance_snapshot`、
-`account_asset_snapshot`、`position_snapshot`、`account_financial_record`、`fee_rate`、
-`trade_order`、`trade_fill`、`strategy_position`、`funding_income`、`mock_account`、`mock_position`。
-（`pnl_daily` 还没建，等模块 8 盈亏核算落地时再建。）
-
-**迁移**：`V1`（一期建表）、`V2`（篮子种子）、`V3`（折扣率）、`V4`（模拟盘/实盘支持标记）、
+**迁移**：`V1`（一期 10 张表）、`V2`（篮子种子）、`V3`（watch_coin 加折扣率）、
+`V4`（watch_coin 加实盘/模拟盘支持标记）、
 `V5`（trade_order、trade_fill、funding_income、mock_account、mock_position、strategy_position）、
-`V6`（event_log 事件日志）、`V7`（mock_position 加 spot_avg_price 现货均价）。
-**规则**：设计期可改 V1 并重置测试库；**schema 冻结后只加新脚本，不改旧的**。
-**每张表的作用见 `docs/database-tables.md`；改任何表结构（加/删/改字段、改唯一键、建表）都必须同步更新它。**
+`V6`（event_log）、`V7`（mock_position 加 spot_avg_price）、`V8`（host_metric_snapshot）。
+**规则**：设计期可改 `V1` 并重置测试库；**schema 冻结后只加新脚本，不改旧的**。
 
-## 关键配置（`src/main/resources/application.yml`）
+**18 张表**：`instrument`、`watch_coin`、`funding_rate_history`、`funding_rate_current`、
+`ticker_snapshot`、`account_balance_snapshot`、`account_asset_snapshot`、`position_snapshot`、
+`account_financial_record`、`fee_rate`、`trade_order`、`trade_fill`、`funding_income`、
+`mock_account`、`mock_position`、`strategy_position`、`event_log`、`host_metric_snapshot`。
+
+> **每张表的作用、谁写谁读、关键字段，见 `docs/database-tables.md`。改任何表结构必须同步更新它。**
+
+当前实际有数据的是：`funding_rate_history`（约 15.6 万行）、`funding_rate_current`、`instrument`、
+`watch_coin`，以及 mock 运行产生的 `mock_account` / `mock_position` / `trade_order` / `trade_fill` /
+`funding_income` / `account_balance_snapshot(source=mock)` / `event_log` / `host_metric_snapshot`。
+`ticker_snapshot` / `account_asset_snapshot` / `position_snapshot` / `account_financial_record` /
+`strategy_position` 目前是**空表**（对应采集/核算尚未实现）。
+
+## 8. 关键配置（`src/main/resources/application.yml`）
 
 | 配置段 | 关键项 | 说明 |
 | --- | --- | --- |
 | `spring.config.import` | `~/.quantification/application-local.yml` | **密钥从这里加载**（仓库外） |
-| `bitget` | `paptrading` | true = 模拟盘（用 demo-* 密钥 + `paptrading:1` 头），false = 实盘 |
-| `watch-coin` | `min-turnover` 500 万、`min-discount-rate` 0.8 | 目标币种池门槛 |
-| `instrument` | 每小时同步交易对规则 | 精度/最小最大/乘数落库 |
-| `strategy` | `enabled`、`allow-real-trading`、`entry-net`、`switch-gap`、`max-holdings`、`max-single-weight`、`lookback-days` | 策略参数 |
-| `execution` | `price-buffer` 1%、`leg-tolerance` 0.5%、`order-timeout-ms`、`max-retries` | 执行参数 |
-| `simulation` | `enabled`、`initial-usdt`、`maintenance-margin-rate`、结算 / 快照间隔 | **自建 mock 开关**：true = 行情读真实接口、下单本地模拟 |
-| `risk` | `max-drawdown` 5%、`mgn-ratio-warn/reduce`、标记价偏离阈值 | 风控参数 |
-| `alert.mail` | SMTP 配置（**密码放仓库外**） | 告警，未接发送逻辑 |
+| `spring.web.resources.cache` | `no-store: true` | 后台静态页不缓存 |
+| `bitget` | `paptrading: false` | 当前用不到（mock 模式不走私有客户端） |
+| `watch-coin` | `min-turnover: 5000000`、`min-discount-rate: 0.8` | 目标币种池门槛 |
+| `strategy` | `enabled`、`allow-real-trading`、`entry-net: 0.05`、`max-holdings: 3`、`max-single-weight: 0.40`、`target-invest-ratio: 0.95`、`lookback-days: 10`、`recovery-filter: true` | 策略参数 |
+| `execution` | `price-buffer`、`leg-tolerance`、`slippage-limit-major/small`、`major-turnover`、`min-order-notional`、`depth-limit` | 执行参数 |
+| `simulation` | `enabled: true`、`initial-usdt: 30000`、`maintenance-margin-rate: 0.02`、`depth-limit`、`ticker-cache-ms`、`rolling-days: 30`、资金费结算/快照间隔 | **自建 mock 开关与参数** |
+| `host-monitor` | `sample-interval-ms: 60000`、`disk-path: /` | 主机监控采样 |
+| `collector` | `history-interval-ms: 3600000`（**已从 6h 调到 1h**）、`current-interval-ms: 600000`、`fee-rate-*` | 采集节奏 |
+| `risk` | `max-drawdown: 0.05`、`mgn-ratio-warn: 0.5`、`mgn-ratio-reduce: 0.8` | 风控阈值 |
+| `alert.mail` | `enabled: true`、`host: smtp.qq.com`、`port: 465`、`username/to: 421791582@qq.com`、`cooldown-seconds: 300` | 邮件告警（**密码在仓库外**） |
+| `alert.transient-failures-before-warning` | `6` | 连续多少次瞬时网络失败后发提醒（不熔断） |
 
-**两道安全闸（防误下真单）**：
-1. `strategy.enabled=false` → 只评估、永不下单
-2. 实盘（`paptrading=false`）时还要求 `strategy.allow-real-trading=true`，否则只打印"本应下单"
+## 9. 管理后台（模块 10）
 
-模式由 `ExchangeGateway` 决定：`simulation.enabled=true` → 自建 mock（不动真实资金，不需要第二道闸）；
-否则由 `bitget.paptrading` 选官方模拟盘或实盘。
+**形态**：Spring Boot 托管静态页（`static/index.html` + `static/app.js`），Vue3 + Element Plus + ECharts
+全部走 CDN，**免构建、免登录、只读**，浏览器打开 `http://localhost:8080`。前端 10s / 30s 轮询。
 
-## 怎么运行
+**7 个页面**：总览（含盈亏核算卡片）、持仓、候选池（含"全历史净年化"列、单币费率曲线）、
+成交与订单、收益曲线、**机器监控**、异常与告警、当前参数（带中文名称与说明）。
 
-```bash
-./mvnw clean test                      # 提交前必须通过
-./mvnw spring-boot:run                 # 启动（会自动下单，模拟盘）
-./mvnw spring-boot:run -Dspring-boot.run.arguments=--strategy.enabled=false   # 只评估不下单
-caffeinate -i ./mvnw spring-boot:run   # 需要整晚跑时，防止 Mac 休眠
+**接口**（全部 GET，前缀 `/api/admin`）：
 
-# 自建 mock（验证策略收益用：行情读真实接口，下单只在本地模拟）
-./mvnw spring-boot:run -Dspring-boot.run.arguments="--simulation.enabled=true"
-curl -s localhost:8080/api/admin/simulation/status         # 现金 / 净值 / 持仓 / 资金费 / 滚动年化
-curl -s localhost:8080/api/admin/simulation/equity-curve   # 模拟净值曲线
-```
-
-启动后的时间线：3s 篮子同步 → 8s 历史费率 → 5s 实时费率 → 10s 交易对规则 → 15s 手续费率 →
-**20s 策略首次评估**（打印候选、决策、下单）。
-
-## 模拟盘实测结论（2026-09-23/24）
-
-| 结论 | 细节 |
+| 接口 | 内容 |
 | --- | --- |
-| **支持 API 交易** | 用模拟盘专用 key + 请求头 `paptrading: 1`；公开产品接口加该头也能拿模拟盘清单（无需签名） |
-| **生产 key 切不到模拟盘** | 实测两次调用返回同一真实账户，必须用模拟盘 key |
-| **覆盖范围很小** | 现货 25 个、合约 45 个，**真实币交集只有 BTC/ETH/DOGE/SOL** |
-| **现货报价部分不可信** | ETH 卖一 54500（真实 2726）、SOL 偏离 55%；**BTC/XLM 正常** → 代码已自动识别并排除 |
-| **限价有 ±2% 风控** | 限价偏离市价超过 2% 直接被拒（`25206`） |
-| **现货默认不计入保证金** | 抵押品模式为 `custom`（仅 USDT/USDC）→ `effEquity` 不含现货；**待确认项，上实盘前必须核实** |
-| **真实结算资金费（已确认）** | 2026-09-24 08:00 到账 +0.4749 USDT（类型 `CONTRACT_MAIN_SETTLE_FEE_USER_IN`）→ **模块 9 不需要自己 mock 资金费** |
-| **但金额口径不可信** | 实际到账 0.4749，而"名义 18,958 × 费率 0.000068 = 1.289"应得 1.289 —— 差 2.7 倍。**模拟盘的资金费金额不能用来校验策略收益**，收益验证仍需自建 mock |
+| `/overview` | 模式 / 策略状态 / 权益 / 保证金率 / 资金费 / 手续费 / 年化 / 持仓数 |
+| `/positions` | 每个持仓币的两腿数量、均价、最新价、未实现盈亏、累计资金费、累计手续费 |
+| `/candidates` | 篮子币的 90 天净/毛年化、成本年化、折扣率、24h 成交额、**全历史净年化** |
+| `/params` | 当前参数（带中文名称、说明；数值已去掉科学计数法） |
+| `/events` | 事件日志（熔断/邮件/下单失败/对账） |
+| `/funding-rate-history?symbol=` | 单币历史费率（画曲线） |
+| `/orders`、`/fills`、`/funding-income`、`/equity-curve` | 订单 / 成交 / 资金费 / 净值曲线（source=mock） |
+| `/pnl` | 盈亏分解（资金费 − 手续费 + 现货/永续已实现 + 未实现 + 校验残差） |
+| `/host`、`/host-history` | 主机当前资源 / 历史曲线 |
 
-## 策略口径（回测与代码一致）
+调试用入口：`/api/admin/simulation/snapshot`、`/settle-funding`（手动触发结算/快照）、
+`/api/admin/collect/*`（手动触发采集）、`/api/admin/alert/test`（发测试告警邮件）。
 
-- **窗口**：10 天，窗口内费率**正负累加**（不是"连续 10 天为正"）
-- **净年化** = 毛年化 − 换仓成本年化；换仓成本 = 2 × (现货吃单 0.06% + 合约吃单 0.0375%) × 365/45 ≈ **1.58%/年**
-  （费率取**私有接口的账户真实值**；公共接口给的标准值偏高，不能用）
-- **结算周期因币而异**（实测 4h 居多），年化按各币实际周期折算
-- **回测结论**（池 ≥500 万、门槛 5%、换仓差 4 个点、最多 3 币）：**年化 11.71%，全程 3 币分散**
-- **费率恢复轮数过滤**：回测里有效（+0.44 个点且不牺牲分散度），**策略代码里还没加**
+## 10. 策略与执行口径（当前代码实际行为）
 
-## 文档索引
+### 10.1 选币与建仓（`FundingAnalysisService` + `StrategyService`）
 
-| 文档 | 内容 |
+1. **窗口**：10 天（`strategy.lookback-days`），窗口内每次结算的费率**正负累加**取平均；
+2. **毛年化** = 平均每期费率 ×（365×24 ÷ 该币实际结算周期 h）；**净年化 = 毛年化 − 换仓成本年化**；
+   换仓成本 = 2 × (现货 0.06% + 合约 0.0375%) × 365/45 ≈ **1.58%/年**；
+3. **可交易**：必须在本轮**篮子**里（`watch_coin.enabled=1`：现货+永续都有、24h 成交额 ≥500 万、折扣率 ≥0.8）；
+4. **恢复轮数过滤**：要求"当前连续为正轮数 > 该币历史从负恢复到正的平均轮数"——**只卡新进**，不卡已持仓；
+5. **建仓门槛**：净年化 ≥ `strategy.entry-net`（当前 **0.05**），不达标宁可空仓；
+6. **取前 N**（`max-holdings=3`，按净年化降序），**按 24h 成交额加权**，单币 ≤40%，总投入 ≤95%。
+
+> 注意：**当前策略不使用"当前实时费率"选币**，用的是 10 天窗口；单日冲高不作为依据。
+> 也**没有实现 `switch-gap` 滞回**（见第 11 节）。
+
+### 10.2 执行（`OrderExecutionService`）
+
+- 下单前取**真实盘口**，算"滑点上限内能吃多少"（主流币 0.05% / 小币 0.15%），超出则与目标取小；
+- **两条腿同时发起**，FOK 限价单（限价 = 对手价 ± 1% 缓冲），要么全成要么全不成；
+- 下单后**必须反查实际成交量**（`order-info` 按 clientOid），一腿没成就用更宽缓冲补；
+- 补不上就**回退已成交的那条腿**（兜底方向永远减仓，绝不加仓追平）；真有残留敞口 → 熔断 + 邮件；
+- 数量一律**向下取整**到交易所精度（绝不四舍五入），规则从 `instrument` 表读；
+- 单笔最小名义 `min-order-notional=20` USDT。
+
+### 10.3 循环（`TradingLoopService`）
+
+- 每小时评估一次；评估异常**分级**：网络类（SSL/连接重置/超时）只 WARN + 下周期重试，
+  业务/未知异常才熔断（熔断 → `event_log` + 邮件）；连续 6 次瞬时失败发一封提醒；
+- 决策：先平掉"不在目标里"的仓位（含**已掉出篮子的孤儿仓位**），再建新仓；
+- **孤儿仓位**：币掉出篮子后仍持仓 → 会被 `currentWeights` 看见并按平仓处理
+  （曾经因为"只遍历篮子"而看不见、资金被锁死，已修）。
+
+## 11. 已知限制 / 配置项未接线（重要）
+
+**配置里写了但代码没有使用的**（新会话别以为已经生效）：
+
+| 配置项 | 现状 |
 | --- | --- |
-| `docs/phase-2-strategy-design.md` | **二阶段策略设计（10 个模块定稿）**，含盘口滑点实测、风控定稿、模拟盘结论 |
-| `docs/troubleshooting.md` | **报错排查与解决方案**（踩过的坑：bash 兼容、Flyway、接口错误码、下单精度、决策过滤、休眠等） |
-| `docs/order-handling.md` | **订单与资金处理最佳实践**（幂等、状态机、精度校验、两条腿纪律、对账、低级错误清单） |
-| `docs/coding-standards.md` | 编码规范（注释、时间类型、包结构、迁移规则） |
-| `docs/data-model.md` | 数据模型 + 全市场扫描结论 |
-| `docs/database-tables.md` | **每张表的作用说明书（改表必须同步更新）** |
-| `docs/api-endpoints.md` | Bitget UTA 接口梳理 |
-| `docs/architecture.md` | 技术选型与架构 |
+| `strategy.switch-gap`（换仓滞回 4 个点） | **未实现**——`StrategyService` 只做"净年化门槛 + 取前 N"，没有"候选比最差持仓高 4 个点才换"的滞回 |
+| `execution.order-timeout-ms`、`execution.max-retries` | **未使用**（执行走的是 FOK + 成交反查，没有超时重下） |
+| `risk.position-watch-interval-ms`、`risk.mark-index-deviation-*` | **未使用**——设计里的"每 5 秒轮询爆仓/ADL"和"标记价偏离"都还没实现 |
+| `risk.max-drawdown` | 已用于熔断判断，但**没有实现"回撤触发即全平"**（只停新仓） |
+| `fee_rate` 表 | mock 模式**不写**（费率是配置常量）；表为空 |
 
-## 安全红线（铁律）
+其他固有限制：
 
-⚠️ **这个仓库是公开的（public），且 API Key 权限很大、关联资金较多。**
+- mock 的简化项见 3.3；
+- **资金费有滞后**：结算点数据来自历史费率（每 1 小时采一次），资金费入账最多滞后约 1 小时；
+- **可能漏结**：若某币掉出篮子前最后一段结算点始终没采到会漏（已在平仓前加"补拉费率"缓解）。
 
-**铁律：密钥在任何场景下都不许进仓库、不许打包、不许提供给外部，只能在本机使用。**
+## 12. 安全红线（铁律）
 
-- 密钥（数据库密码、Bitget 的 api-key / secret-key / passphrase、模拟盘 demo-* 密钥、SMTP 密码）
-  只放**仓库外**的：`~/.quantification/application-local.yml`（权限 600），由 `spring.config.import` 自动加载
-- **永远不要**在 `src/main/resources/` 下建 `application-local.yml`，也不要把密码写进 `application.yml`
+⚠️ 仓库是**公开的**，且 API Key 权限大、关联资金。
+
+- 密钥（DB 密码、Bitget api-key/secret-key/passphrase、demo 密钥、SMTP 密码）**只能**放
+  `~/.quantification/application-local.yml`（权限 600，仓库外）。
+- **永远不要**在 `src/main/resources/` 下建 `application-local.yml`，也不要把密码写进 `application.yml`。
 - 两道自动防护，**别绕过**（提交不要加 `--no-verify`）：
-  - **构建校验**：`pom.xml` 的 exec-maven-plugin 在 validate / package 阶段跑 `scripts/check-secrets.sh`
-  - **提交钩子**：`.githooks/pre-commit`（已执行 `git config core.hooksPath .githooks`；**新克隆要再做一次**）
-- 整个项目目录可以安全地拷给别人（里面没有密钥）；`~/.quantification/application-local.yml` 是密钥唯一副本，注意备份
+  构建校验（`scripts/check-secrets.sh`，validate/package 阶段跑）+ 提交钩子（`.githooks/pre-commit`）。
+- ⚠️ **历史事故（务必阅读）**：2026-10-04 会话中，一次掩码写错的命令把
+  **数据库密码、Bitget 实盘/模拟盘密钥、QQ 授权码**打印进了工具输出（即对话上下文）。
+  已建议**轮换实盘 API Key**。**新会话读密钥文件时只读"键名"、不要打印值**，
+  或用 `awk -F'"' '/password:/{print $2}'` 这类只取单向值、绝不 echo 的写法。
 
-## 分支与协作约定
+## 13. 分支与协作约定
 
-- 主干是 **`master`**（不是 main）
-- 流程：从 master 拉 `feature/xxx` → 开发 → 推送 → PR → 合并回 master
-- 合并前必须 `./mvnw clean test` 通过
-- 远程走 SSH：`git@github.com:xiaochenge/quantification.git`（`~/.ssh/config` 里配了 ssh.github.com:443）
-- 和用户协作：**用中文沟通**；动手改代码前先给方案；一次只做一件事；不确定就问
-- 用户偏好：**核心交易/策略模块**要仔细确认；**非核心模块**（盈亏核算、模拟、后台）可以直接定，
-  但要把决定和理由说清楚
+- 主干是 **`master`**；流程：`feature/xxx` → 推送 → PR → 合并 。
+- 当前分支已从拼写错误的 `feautre/...` 改名为 **`feature/init_Requirement_Design`（本地）**；
+  远端仍是旧名，需要时 `git push -u origin feature/init_Requirement_Design` 再删除旧远端分支。
+- `.idea` 已 `git rm --cached` 移出版本控制（本地文件仍在）。
+- **提交现状（2026-10-04）**：最新提交 `c8fccce 完成资金费率初版，项目运行` 已包含自建 mock、
+  管理后台、邮件告警、事件表、`deploy/` 的 launchd plist、`.idea` 移出版本控制、以及全部文档。
+  **尚未提交**的是最近这一批：**主机监控**（`V8` 迁移 + `HostMetric` / `HostMetricMapper` /
+  `HostMonitorService` / 后台"机器监控"页）+ 静态页 `no-store` 缓存配置 + 参数页中文说明 /
+  去科学计数法 + 候选池"全历史净年化"列。**新会话动代码前先 `git status` 确认。**
+- 和用户协作：**用中文沟通**；**动手改代码前先给方案**；一次只做一件事；不确定就问。
+- 用户偏好：**核心交易/策略模块**要仔细确认；非核心模块可直接定，但要说清决定与理由。
 
-## 待办与遗留问题
+## 14. 待办与遗留
 
-1. **当前分支名有拼写错误**：`feautre/init_Requirement_Design` 应为 `feature/init_Requirement_Design`
-2. `.idea/` 已加进 .gitignore，但之前提交的 `.idea/*.xml` 仍在版本控制里，需要 `git rm -r --cached .idea`
-3. **上实盘前必须核实：实盘账户的抵押品模式**（现货是否计入保证金，影响收益是否要打对折）
-4. ~~待验证：模拟盘是否真实结算资金费~~ → **已验证会结算**，但金额口径与标准公式不一致（见"模拟盘实测结论"）
-4b. **历史费率采集有最多 6 小时滞后**（每 6 小时拉一次增量）：对 10 天窗口的策略无影响，但后台"最新费率"会滞后，后续可考虑把增量采集频率提高
-5. **自建 mock 已落地**（模块 9 v1，见"下一步开发计划"第 1 条）：验证策略收益改走它
-5b. **mock 的已知简化**：平仓数量超持仓按"减到零"处理（实盘会拒单）；开空保证金按 1 倍有效权益粗算；
-    资金费名义值用结算时刻最新价近似；**结算点数据最多滞后 6 小时，若刚过结算点就平仓可能漏记最后一段资金费**（模块 8 用真实流水核对时补算）
-6. 盈亏核算、管理后台、邮件告警、恢复轮数过滤、实盘订单状态机、下架监控：见"未完成"清单
-7. **部署方案待定**：打成可执行 jar 用 launchd 托管，还是用 Docker
-8. 服务器到位后要处理：关闭自动休眠、配 UPS 防断电、数据库定期备份
+1. **下单 / 换仓逻辑**（下一阶段重点，见第 15 节）；
+2. 模块 8 完整盈亏核算（按"一组仓位"结算、滚动年化、归因、基准）；
+3. `strategy.switch-gap` 滞回未实现（见第 11 节）；
+4. 实盘路径的订单落库与状态机；
+5. `risk` 的 5 秒持仓轮询 / 标记价偏离未实现；
+6. 下架公告监控；
+7. 部署细节：launchd 已托管，将来服务器到位后要处理关闭休眠、UPS、数据库定期备份；
+8. 历史费率增量采集现已 1 小时一次，若后台仍嫌滞后可再调。
 
-## 下一步开发计划（按优先级，新会话可直接开工）
+## 15. 下一步开发计划（新会话从这里开始）
 
-### 1. 自建 mock（模块 9）—— ✅ 已完成（2026-09-24，v1）
+### 1. 下单 / 换仓逻辑（最高优先级）
 
-**落地形态**（详见 `docs/phase-2-strategy-design.md` 第 10.5 节）：
+涉及代码：
 
-- `com.quantification.exchange`：`ExchangeGateway` 接口 + `RealExchangeGateway`（实盘 / 官方模拟盘）
-  + `MockExchangeGateway`（自建 mock）+ `MatchEngine`（按真实盘口逐档撮合，算成交均价与滑点）
-- 开关：`simulation.enabled=true`（`bitget.paptrading` 继续负责区分实盘 / 官方模拟盘，两道安全闸不变）
-- 模拟账本：`trade_order` / `trade_fill`（source=mock）、`mock_account` / `mock_position`（现金与持仓，重启可恢复）、
-  `funding_income`（资金费自己算，按结算点幂等去重）
-- 只读接口：`GET /api/admin/simulation/status`、`GET /api/admin/simulation/equity-curve`；
-  另有调试用的 POST `/snapshot`、`/settle-funding`
+- `service/StrategyService.java` —— 目标仓位（**目前只做门槛 + 取前 N，没有滞回**）；
+- `service/OrderExecutionService.java` —— 建仓 / 平仓的 FOK 两腿、补单、回退；
+- `service/TradingLoopService.java` —— 评估 → 平不在目标里的 → 建新仓；
+- `exchange/MockExchangeGateway.java` + `exchange/MatchEngine.java` —— mock 撮合与拒单规则
+  （改下单逻辑时要同步考虑模拟是否还原真实行为）；
+- `docs/order-handling.md` —— 订单与资金纪律（改之前必读）。
 
-**已实测**（2026-09-24）：42 币候选池选出 3 个建仓（现货买 + 永续空），按真实盘口成交并记录滑点与手续费；
-重启后自动接管 3 组模拟持仓；资金费按真实结算点入账（3 币 × 6 个结算点 = 2.58 USDT/天，对应名义 8.6k，
-折算年化约 11%，与 `scripts/backtest-funding.py` 的结论同量级）。
+改动要点提醒：
 
-**为什么必须做**：官方模拟盘只覆盖 BTC/ETH/DOGE/SOL，其中 **ETH/SOL 的现货报价是坏的**
-（ETH 卖一 54500 而市价 2726），实际只能拿 BTC 跑流程；而且它的**资金费金额口径与标准公式不一致**
-（实得 0.4749 vs 应得 1.289，差 2.7 倍）。**要验证策略收益（8% 目标）只能靠自建 mock。**
+- 换仓目前是"平掉不在目标里的、建目标里的"，**没有 `switch-gap` 滞回**，
+  也没有"只调权重不换腿"的再平衡；
+- 每次换仓的成本都是真实的（手续费 + 基差/滑点），改完要用 mock 观察 `/api/admin/pnl`
+  的分解是否合理；
+- 改完必须 `./mvnw clean test` 通过，并重新 `package` + 重启 launchd 服务。
 
-**做法**（复用一期就定好的"Real / Mock 双实现"）：
+### 2. 模块 8 盈亏核算（完整版）
 
-- **行情、费率、盘口全部读真实接口**；**下单 / 撤单 / 查单在本地模拟**
-- 成交价用**真实盘口深度**推算（算法见 `scripts/orderbook-slippage.py`），并计入滑点与手续费
-- 模拟订单/成交写入 `trade_order` / `trade_fill`，`source = mock`
-- 资金费按**真实费率 × 仓位**记入 `funding_income`（`source = mock`）——
-  这正是模拟盘算错的部分，所以**必须自己算**
-- **其余模块（调度、决策、风控、对账、核算）与实盘共用同一套代码**，只替换交易所实现
-- 建议加 `strategy.mode: real | demo | mock` 开关（或复用 `bitget.paptrading` + 新增 `simulation.enabled`）
+口径见 `docs/phase-2-strategy-design.md` 9.1：净值双口径、成本按笔记/按组汇总、
+资金费以交易所流水为准、按"一组策略仓位"结算、滚动 7/30/90 天 + 累计、单币 + 组合归因、闲钱基准。
+现在的 `/api/admin/pnl` 只是最小版。
 
-**验收**：能对完整候选池（40+ 币）跑出一段时间的净值曲线与滚动年化，量级与
-`scripts/backtest-funding.py` 的结论（≥500 万池、年化 11.71%）大致吻合。
+### 3. 补齐缺口
 
-### 2. 盈亏核算（模块 8）
+`strategy.switch-gap`、实盘订单落库、`risk` 的轮询与标记价偏离（见第 11 节）。
 
-**为什么**：后台看板的数据全靠它，也是判断"策略到底赚了多少"的唯一依据。
+## 16. 写代码前必读
 
-**口径（已定稿，详见 `docs/phase-2-strategy-design.md` 9.1）**：
+1. `docs/coding-standards.md` —— 注释、时间类型、包结构、迁移规则；
+2. `docs/order-handling.md` —— **订单与资金**：幂等、状态机、精度、两条腿纪律；
+3. `docs/troubleshooting.md` —— 踩过的坑（bash 兼容、Flyway、接口错误码、下单精度、休眠、缓存）；
+4. `docs/database-tables.md` —— **18 张表的作用（改表必须同步更新）**；
+5. `docs/phase-2-strategy-design.md` —— 二阶段设计（模块 3~10），但**以本文件与代码为准**；
+6. `docs/data-model.md`、`docs/api-endpoints.md`、`docs/architecture.md` —— 参考。
 
-- 净值**双口径**：交易所 `accountEquity`（对账用）+ 自算策略口径（评估用）
-- 成本：手续费与滑点**按每笔成交记原始值、按每次换仓汇总**
-- 资金费：**以交易所真实流水为准**（`account_financial_record`），理论值只作对照
-- 已实现/未实现：以"**一组策略仓位**"为单位结算
-- 年化：默认**含成本、滚动 30 天**，另提供 7/90 天与累计
-- 归因：单币 + 组合两级；加"闲钱活期"基准线
+## 17. 机器与部署规划
 
-**验收**：后台接口能返回上述指标；与交易所流水核对能解释每一分钱差异。
+**当前这台（已当服务器长期运行）**：Mac mini（Mac16,11，Apple M4 Pro，24GB，512GB）。
 
-### 3. 补齐既有设计的缺口
+- 已配：JDK 24、MySQL 8.4.11、launchd 托管（MySQL / 应用 / 防休眠）、Tailscale + 屏幕共享 + SSH。
+- 负载特征：应用进程占用很小（JVM 堆几十 MB），CPU 大部分时间空闲（每小时评估一次）；
+  内存"使用率"接近 100% 是 macOS 把空闲内存当文件缓存，**不是异常**，真正要看"交换区是否增长"。
+- 建议常备：**HDMI 虚拟显示器诱骗器**（无头远程桌面分辨率）。
 
-- **费率恢复轮数过滤**：回测脚本里已实现（`scripts/backtest-funding.py` 的 `precompute_recovery`），
-  `FundingAnalysisService` 里还没加。回测显示它 +0.44 个点且不牺牲分散度
-- **订单 / 成交落库**：当前靠"查交易所状态"做幂等，没用 `trade_order` / `trade_fill` 表。
-  落库后才能做订单状态机、对账留痕、盈亏归因
-- （次要）把历史费率的增量采集频率从 6 小时提高，减少后台展示滞后
-
-**验收**：`trade_order` / `trade_fill` / `strategy_position` 有数据；重启后能靠"本地记录 + 交易所对账"恢复状态。
-
-## 写代码前必读
-
-1. `docs/coding-standards.md` —— 注释、时间类型、包结构、迁移规则
-2. `docs/order-handling.md` —— **订单与资金相关**：幂等、状态机、精度校验、两条腿纪律
-3. `docs/troubleshooting.md` —— **先扫一遍**，避免重复踩坑
-4. `docs/database-tables.md` —— **每张表的作用（改表前先看，改完同步更新）**
-
-## 机器与部署规划
-
-**当前这台——开发机**
-
-- Mac mini（Mac16,11），Apple M4 Pro，24GB 内存，512GB SSD，macOS 27
-- 环境已配好：JDK 24、Maven 3.9.16（PATH 写在 `~/.zshrc`）、Git 身份 `xiaochenge`
-- 按开发机定位使用，不需要 24 小时开机（**需要整晚跑测试时用 `caffeinate -i`**）
-
-**将来那台——服务器**
-
-- 计划再买一台 Mac mini，专门部署正式运行
-- 到那时需要：UPS 防断电、关闭自动休眠、数据库备份、开机自启
-- 现在不用操心，但写代码时别依赖开发机的专有路径和手工步骤
+**将来**：如需更强的机器再考虑；当前配置对项目负载绰绰有余。

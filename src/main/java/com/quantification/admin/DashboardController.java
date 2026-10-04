@@ -4,16 +4,18 @@ import com.quantification.entity.AccountBalanceSnapshot;
 import com.quantification.entity.EventLog;
 import com.quantification.entity.FundingIncome;
 import com.quantification.entity.FundingRateHistory;
+import com.quantification.entity.HostMetric;
 import com.quantification.entity.TradeFill;
 import com.quantification.entity.TradeOrder;
 import com.quantification.service.DashboardService;
 import com.quantification.service.DashboardService.CandidateView;
 import com.quantification.service.DashboardService.Overview;
 import com.quantification.service.DashboardService.Pnl;
+import com.quantification.service.DashboardService.ParamView;
 import com.quantification.service.DashboardService.PositionView;
 import com.quantification.service.SimulationService;
+import com.quantification.service.HostMonitorService;
 import java.util.List;
-import java.util.Map;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -35,9 +37,15 @@ public class DashboardController {
     /** 模拟盘账务（成交/资金费/净值曲线复用它的查询）。 */
     private final SimulationService simulationService;
 
-    public DashboardController(DashboardService dashboardService, SimulationService simulationService) {
+    /** 主机资源监控。 */
+    private final HostMonitorService hostMonitorService;
+
+    public DashboardController(DashboardService dashboardService,
+                               SimulationService simulationService,
+                               HostMonitorService hostMonitorService) {
         this.dashboardService = dashboardService;
         this.simulationService = simulationService;
+        this.hostMonitorService = hostMonitorService;
     }
 
     /** 总览。 */
@@ -60,7 +68,7 @@ public class DashboardController {
 
     /** 当前参数。 */
     @GetMapping("/params")
-    public Map<String, Object> params() {
+    public List<ParamView> params() {
         return dashboardService.params();
     }
 
@@ -105,5 +113,17 @@ public class DashboardController {
     @GetMapping("/pnl")
     public Pnl pnl() {
         return dashboardService.pnl();
+    }
+
+    /** 机器当前资源使用情况（CPU / 内存 / 磁盘 / 负载）。 */
+    @GetMapping("/host")
+    public HostMetric host() {
+        return hostMonitorService.current();
+    }
+
+    /** 机器资源历史曲线（倒序）。 */
+    @GetMapping("/host-history")
+    public List<HostMetric> hostHistory(@RequestParam(defaultValue = "1000") int limit) {
+        return hostMonitorService.recent(limit);
     }
 }

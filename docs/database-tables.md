@@ -7,8 +7,8 @@
 
 ## 0. 总览
 
-当前共 **16 张业务表**（另有 Flyway 自带的 `flyway_schema_history`，不算业务表）。
-按性质分四类：
+当前共 **18 张业务表**（另有 Flyway 自带的 `flyway_schema_history`，不算业务表）。
+按性质分类（迁移 `V1`~`V8`）：
 
 | 类别 | 表 | 一句话作用 |
 | --- | --- | --- |
@@ -28,6 +28,8 @@
 | 模拟 | `mock_account` | 自建 mock 的账户现金（单行表） |
 | 模拟 | `mock_position` | 自建 mock 的持仓（重启恢复用） |
 | 策略 | `strategy_position` | 一组"现货多 + 永续空"对冲组合（业务视角） |
+| 运营 | `event_log` | 事件日志：熔断 / 邮件 / 下单失败 / 对账接管 |
+| 监控 | `host_metric_snapshot` | 主机资源快照（CPU / 内存 / 磁盘 / 负载 / 交换区） |
 
 通用约定（详见 `docs/coding-standards.md`）：时间用 `DATETIME`（Asia/Shanghai，不用毫秒时间戳）；
 金额/数量用 `DECIMAL(38,18)`；`created_at` / `updated_at` 由数据库自动维护；每个字段都写 `COMMENT`。
@@ -226,7 +228,33 @@
 
 ---
 
-## 7. 数据流（谁写、谁读）
+## 7. 运营与监控表
+
+### 7.1 `event_log` — 事件日志
+
+- **作用**：把"必须让人知道"的事件落一条，供后台"异常与告警"页展示与事后追溯。
+  在此之前熔断 / 邮件 / 对账差异只写日志、不留库。
+- **数据来源**：`EventLogService.log(...)`，由 `RiskService`（熔断）、`MailAlertService`（邮件发送成功/失败）、
+  `OrderExecutionService`（下单失败）、`TradingLoopService`（启动对账接管）调用。
+- **谁读**：后台 `GET /api/admin/events`。
+- **更新方式**：只追加（写失败会静默降级为日志，绝不影响主流程）。
+- **关键字段**：`source`、`level`（INFO/WARN/ERROR）、`type`（halt/mail/order/reconcile）、`title`、`detail`、`created_at`。
+
+### 7.2 `host_metric_snapshot` — 主机资源快照
+
+- **作用**：记录这台 Mac 的 CPU / 内存 / 磁盘 / 负载 / 交换区，画历史曲线，用于判断
+  "当前机器够不够用、要不要换更强的机器"。
+- **数据来源**：`HostMonitorService`，默认**每 1 分钟**一条。数据来自 JVM 自带 MXBean（CPU / 物理内存）、
+  `File.getTotalSpace/getUsableSpace`（磁盘）、`sysctl vm.swapusage`（macOS 交换区，JDK 不暴露）。
+- **谁读**：后台 `GET /api/admin/host`（当前值）、`GET /api/admin/host-history`（历史）。
+- **更新方式**：只追加（90 天约 13 万行，可长期保留）。
+- **注意**：macOS 的"内存已用"含文件缓存，接近 100% 属正常；判断内存压力应看 `swap_used_bytes` 是否增长。
+  功耗（瓦数）无法以普通权限读取（`powermetrics` 需 root），未采集。
+- **关键字段**：`cpu_load_pct`、`process_cpu_load_pct`、`cpu_cores`、`load_average`、
+  `mem_total_bytes`、`mem_used_bytes`、`heap_used_bytes`、`heap_max_bytes`、
+  `swap_total_bytes`、`swap_used_bytes`、`disk_total_bytes`、`disk_used_bytes`、`sampled_at`。
+
+## 8. 数据流（谁写、谁读）
 
 | 表 | 写 | 读 |
 | --- | --- | --- |
@@ -246,3 +274,5 @@
 | mock_account | MockExchangeGateway | MockExchangeGateway |
 | mock_position | MockExchangeGateway | MockExchangeGateway |
 | strategy_position | （模块 8 用） | （模块 8 用） |
+| event_log | RiskService / MailAlertService / OrderExecutionService / TradingLoopService | 后台 `/api/admin/events` |
+| host_metric_snapshot | HostMonitorService（每分钟） | 后台 `/api/admin/host`、`/host-history` |
