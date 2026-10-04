@@ -1,6 +1,7 @@
 package com.quantification.service;
 
 import com.quantification.entity.FundingRateCurrent;
+import com.quantification.entity.FundingRateHistory;
 import com.quantification.entity.FundingRateStat;
 import com.quantification.mapper.FundingRateCurrentMapper;
 import com.quantification.mapper.FundingRateHistoryMapper;
@@ -42,19 +43,23 @@ public class FundingAnalysisService {
     private final BigDecimal spotTakerFeeRate;
     private final BigDecimal perpTakerFeeRate;
     private final int rotationDays;
+    /** 是否启用"恢复轮数过滤"（要求当前连续为正轮数 > 历史平均恢复轮数才允许建仓）。 */
+    private final boolean recoveryFilter;
 
     public FundingAnalysisService(FundingRateHistoryMapper historyMapper,
                                   FundingRateCurrentMapper currentMapper,
                                   @Value("${strategy.lookback-days:10}") int lookbackDays,
                                   @Value("${funding-yield.spot-taker-fee-rate:0.0006}") BigDecimal spotTakerFeeRate,
                                   @Value("${funding-yield.perp-taker-fee-rate:0.000375}") BigDecimal perpTakerFeeRate,
-                                  @Value("${funding-yield.rotation-days:45}") int rotationDays) {
+                                  @Value("${funding-yield.rotation-days:45}") int rotationDays,
+                                  @Value("${strategy.recovery-filter:true}") boolean recoveryFilter) {
         this.historyMapper = historyMapper;
         this.currentMapper = currentMapper;
         this.lookbackDays = lookbackDays;
         this.spotTakerFeeRate = spotTakerFeeRate;
         this.perpTakerFeeRate = perpTakerFeeRate;
         this.rotationDays = rotationDays;
+        this.recoveryFilter = recoveryFilter;
     }
 
     /**
@@ -102,6 +107,81 @@ public class FundingAnalysisService {
     /** @return 当前使用的窗口天数（配置项） */
     public int getLookbackDays() {
         return lookbackDays;
+    }
+
+    /** @return 是否启用恢复轮数过滤（配置项 strategy.recovery-filter） */
+    public boolean isRecoveryFilterEnabled() {
+        return recoveryFilter;
+    }
+
+    /**
+     * 恢复轮数过滤：判断该币当前是否满足"连续为正轮数 > 历史平均恢复轮数"。
+     *
+     * <p>与回测脚本 {@code scripts/backtest-funding.py} 的 {@code precompute_recovery} +
+     * {@code recovery_ok} 同口径：
+     * <ul>
+     *   <li>历史平均恢复轮数：把每一笔<b>负费率</b>到"下一次转正"相隔的轮数求前缀平均
+     *       （数据都在"当前时刻之前"，不含未来信息）；</li>
+     *   <li>当前连续为正轮数：从最近一笔往回数，连续为正的结算轮数；</li>
+     *   <li>历史上还没出现过负费率（平均为空）时不拦；没数据也不拦。</li>
+     * </ul>
+     *
+     * <p>只有新进候选才需要过这关（已持仓币不重复过滤，避免反复开平），过滤本身在
+     * {@link StrategyService} 里应用，这里只算"过没过"。
+     *
+     * @param symbol 永续交易对
+     * @return true = 通过（或无需过滤）；false = 未通过
+     */
+    public boolean recoveryFilterPassed(String symbol) {
+        if (!recoveryFilter) {
+            return true;
+        }
+        List<BigDecimal> rates = new ArrayList<>();
+        for (FundingRateHistory row : historyMapper.findOrderedBySymbol(symbol)) {
+            rates.add(row.getFundingRate());
+        }
+        return recoveryPassed(rates);
+    }
+
+    /**
+     * 恢复轮数过滤的纯计算（从序列里提取，方便单测）。
+     *
+     * @param rates 按结算时间升序的费率序列
+     * @return true = 通过（或无需过滤）；false = 未通过
+     */
+    static boolean recoveryPassed(List<BigDecimal> rates) {
+        if (rates.isEmpty()) {
+            return true;   // 没有逐笔数据就不拦（与回测 recovery_ok 一致）
+        }
+        // 当前连续为正的轮数：从最新一笔往回数
+        int streak = 0;
+        for (int i = rates.size() - 1; i >= 0; i--) {
+            BigDecimal rate = rates.get(i);
+            if (rate != null && rate.signum() > 0) {
+                streak++;
+            } else {
+                break;
+            }
+        }
+
+        // 历史"从负恢复到正"的平均轮数：从后往前扫，遇到负费率就记它到下一次转正的距离
+        Integer nextPositive = null;
+        BigDecimal total = BigDecimal.ZERO;
+        int seen = 0;
+        for (int i = rates.size() - 1; i >= 0; i--) {
+            BigDecimal rate = rates.get(i);
+            if (rate != null && rate.signum() > 0) {
+                nextPositive = i;
+            } else if (rate != null && nextPositive != null) {
+                total = total.add(BigDecimal.valueOf(nextPositive - i));
+                seen++;
+            }
+        }
+        if (seen == 0) {
+            return true;   // 历史上还没出现过负费率，不拦
+        }
+        BigDecimal avgRecovery = total.divide(BigDecimal.valueOf(seen), 8, RoundingMode.HALF_UP);
+        return BigDecimal.valueOf(streak).compareTo(avgRecovery) > 0;
     }
 
     /**

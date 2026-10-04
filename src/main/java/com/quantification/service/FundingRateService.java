@@ -41,11 +41,14 @@ public class FundingRateService {
     /** 历史接口单页最大条数，官方限制为 100。 */
     private static final int PAGE_SIZE = 100;
 
-    /** 首次回补最多翻几页。90 天约 3 页（3 次/天），留足余量。 */
-    private static final int MAX_PAGES = 5;
-
-    /** 已采过的币只拉最新一页做增量，不重复回补历史。 */
-    private static final int INCREMENTAL_PAGES = 1;
+    /**
+     * 翻页的安全上限。
+     *
+     * <p>接口只返回最近 90 天；结算周期最短的币是 1 小时，90 天最多 90×24=2160 条，
+     * 即 22 页，这里留 30 页兜底。增量采集会在"碰到库里已有结算点"时提前停，
+     * 正常不会真的翻这么多页，这个上限只是防止接口异常时无限循环。
+     */
+    private static final int MAX_PAGES = 30;
 
     private final BitgetPublicClient bitget;
     private final WatchCoinMapper watchCoinMapper;
@@ -101,7 +104,16 @@ public class FundingRateService {
     }
 
     /**
-     * 采集单个币种的历史费率，按页码翻页直到没有更多数据。
+     * 采集单个币种的历史费率。
+     *
+     * <p>核心：<b>从新到旧逐页拉取，一旦碰到库里已有的结算点就停</b>。这样：
+     * <ul>
+     *   <li>首次采集（库里没有该币）会一路翻到接口的 90 天边界；</li>
+     *   <li>暂停再启动时，只把"库中最新的结算点之后"这段补回来，<b>中间不断档</b>，也不重复拉旧数据；</li>
+     *   <li>库里的老数据原样保留——接口只给 90 天，但本地表从不删除，最早那批 90 天记录继续存在。</li>
+     * </ul>
+     *
+     * <p>幂等靠 {@code (symbol, funding_time)} 唯一键：重叠部分即使重复插入也会被跳过。
      *
      * @param symbol   永续交易对
      * @param category 产品线
@@ -109,17 +121,25 @@ public class FundingRateService {
      */
     private int collectHistoryFor(String symbol, String category) {
         int saved = 0;
-        // 首次采集（库里没有该币数据）才翻页回补 90 天；之后只拉最新一页做增量
-        int maxPages = historyMapper.countBySymbol(symbol) > 0 ? INCREMENTAL_PAGES : MAX_PAGES;
-        for (int page = 1; page <= maxPages; page++) {
+        LocalDateTime latestStored = historyMapper.latestFundingTime(symbol);
+        for (int page = 1; page <= MAX_PAGES; page++) {
             List<FundingRatePoint> points = bitget.historyFundingRate(category, symbol, PAGE_SIZE, page);
             if (points.isEmpty()) {
                 break;
             }
+            boolean reachedExisting = false;
             for (FundingRatePoint point : points) {
-                saved += historyMapper.insertIgnore(toHistoryEntity(symbol, category, point));
+                FundingRateHistory row = toHistoryEntity(symbol, category, point);
+                // 接口按结算时间从新到旧返回：一旦碰到库里已有（或更早）的结算点，
+                // 说明后面的全是老数据，停止翻页。
+                if (latestStored != null && row.getFundingTime() != null
+                        && !row.getFundingTime().isAfter(latestStored)) {
+                    reachedExisting = true;
+                    break;
+                }
+                saved += historyMapper.insertIgnore(row);
             }
-            if (points.size() < PAGE_SIZE) {
+            if (reachedExisting || points.size() < PAGE_SIZE) {
                 break;
             }
         }

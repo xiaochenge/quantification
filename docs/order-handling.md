@@ -114,3 +114,4 @@
 | 对账与重启接管 | `service/ReconciliationService`（模块 7） |
 | 熔断与告警 | `service/RiskService` + 邮件告警 |
 | 订单与成交落库 | `mapper/TradeOrderMapper`、`mapper/TradeFillMapper`（模块 2 的表） |
+| 模式隔离（实盘 / 官方模拟盘 / 自建 mock） | `exchange/ExchangeGateway` + `exchange/RealExchangeGateway` + `exchange/MockExchangeGateway`（模块 9 落地）；下单/撤单/查单都经这一层 |

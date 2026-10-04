@@ -29,6 +29,12 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
+        <!-- 邮件告警（模块 6）：用 JavaMail 发熔断/异常通知 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-mail</artifactId>
+        </dependency>
+
         <!-- MyBatis 持久层 -->
         <dependency>
             <groupId>org.mybatis.spring.boot</groupId>

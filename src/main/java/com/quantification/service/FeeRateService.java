@@ -1,10 +1,11 @@
 package com.quantification.service;
 
-import com.quantification.bitget.BitgetPrivateClient;
 import com.quantification.bitget.BitgetPrivateClient.FeeRateItem;
 import com.quantification.bitget.BitgetPublicClient;
 import com.quantification.entity.FeeRate;
 import com.quantification.entity.WatchCoin;
+import com.quantification.exchange.ExchangeGateway;
+import com.quantification.exchange.TradeMode;
 import com.quantification.mapper.FeeRateMapper;
 import com.quantification.mapper.WatchCoinMapper;
 import java.math.BigDecimal;
@@ -34,14 +35,15 @@ public class FeeRateService {
 
     private static final ZoneId ZONE = ZoneId.of("Asia/Shanghai");
 
-    private final BitgetPrivateClient privateClient;
+    /** 交易网关：实盘 / 官方模拟盘取交易所真实费率，自建 mock 取配置里的假设费率。 */
+    private final ExchangeGateway exchange;
     private final WatchCoinMapper watchCoinMapper;
     private final FeeRateMapper feeRateMapper;
 
-    public FeeRateService(BitgetPrivateClient privateClient,
+    public FeeRateService(ExchangeGateway exchange,
                           WatchCoinMapper watchCoinMapper,
                           FeeRateMapper feeRateMapper) {
-        this.privateClient = privateClient;
+        this.exchange = exchange;
         this.watchCoinMapper = watchCoinMapper;
         this.feeRateMapper = feeRateMapper;
     }
@@ -59,8 +61,14 @@ public class FeeRateService {
      * @return 写入行数；未配置 API Key 时返回 0
      */
     public int collect() {
-        if (!privateClient.isConfigured()) {
-            log.warn("未配置 Bitget API Key，跳过分手续费率采集");
+        if (!exchange.isConfigured()) {
+            log.warn("当前模式（{}）未配置 API Key，跳过手续费率采集", exchange.mode().getLabel());
+            return 0;
+        }
+        if (exchange.mode() == TradeMode.MOCK) {
+            // 自建 mock 的手续费率是配置常量（funding-yield.*-taker-fee-rate），不是账户真实值，
+            // 快照下来没有意义；而且 fee_rate 表没有 source 列，混进去会污染成本核算。
+            log.info("自建 mock 模式跳过手续费率采集（费率是配置常量，不入 fee_rate 表）");
             return 0;
         }
         Set<String> basket = new HashSet<>();
@@ -78,7 +86,7 @@ public class FeeRateService {
 
     private int saveCategory(String category, Set<String> basket) {
         int saved = 0;
-        for (FeeRateItem item : privateClient.allFeeRates(category)) {
+        for (FeeRateItem item : exchange.allFeeRates(category)) {
             if (!basket.contains(item.symbol())) {
                 continue;
             }

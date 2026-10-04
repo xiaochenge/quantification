@@ -53,7 +53,7 @@ collector:
   current-initial-delay-ms: 5000     # 启动 5 秒后开始第一次
   current-interval-ms: 600000        # 实时资金费率：每 10 分钟
   history-initial-delay-ms: 8000     # 启动 8 秒后开始第一次
-  history-interval-ms: 21600000      # 历史资金费率回补：每 6 小时
+  history-interval-ms: 3600000       # 历史资金费率回补：每 1 小时（原来 6 小时；结算点滞后太久会让资金费迟迟不入账）
   fee-rate-initial-delay-ms: 15000   # 启动 15 秒后采一次费率（等篮子同步完）
   fee-rate-interval-ms: 86400000     # 手续费率（账户真实值）：每天一次
 
@@ -82,10 +82,8 @@ strategy:
   allow-real-trading: false
   evaluate-interval-ms: 3600000  # 评估频率：每小时一次
   lookback-days: 10              # 综合费率窗口（天），正负累加
-  # 建仓门槛：净年化。正常用 0.05；
-  # 临时降到 0.04 是为了在官方模拟盘上跑通流程（模拟盘只支持 BTC/ETH/DOGE/SOL，
-  # 其中现货报价可信的只有 BTC，而 BTC 净年化约 4.5%）。验证完请改回 0.05。
-  entry-net: 0.04
+  # 建仓门槛：净年化（含成本）≥ 5% 才建仓，低于则宁可空仓
+  entry-net: 0.05
   switch-gap: 0.04               # 换仓门槛：候选比最差持仓高 4 个百分点
   max-holdings: 3                # 最多同时持有几个币
   max-single-weight: 0.40        # 单币仓位上限（占总资金）
@@ -113,6 +111,30 @@ instrument:
   sync-initial-delay-ms: 10000   # 启动 10 秒后同步一次（早于策略首次评估）
   sync-interval-ms: 3600000      # 之后每小时同步一次
 
+# ============================================================
+# 自建 mock（模块 9）：验证策略收益用（官方模拟盘只覆盖 4 个币，且资金费金额口径不可信）
+#
+# **已定方案：默认走自建 mock（不走官方模拟盘、不动 demo 账户）。**
+#
+# enabled=true 时：
+#   * 行情 / 费率 / 盘口仍然读真实接口；
+#   * 下单 / 撤单 / 查单在本地模拟撮合（按真实盘口深度算成交价与滑点），
+#     模拟成交落库到 trade_order / trade_fill（source=mock），不会发出任何真实交易请求；
+#   * 资金费由程序自己按"真实费率 × 真实仓位"入账（funding_income，source=mock）。
+# enabled=false 时才会用 bitget.paptrading 决定走实盘还是官方模拟盘（现在不用）。
+# ============================================================
+simulation:
+  enabled: true                  # 总开关：true = 用自建 mock 交易所（当前默认）
+  initial-usdt: 30000            # 模拟账户初始资金（USDT），只在第一次运行（库里没有账户）时生效；第一期投入 3 万
+  maintenance-margin-rate: 0.02  # 维持保证金率假设（算 mgnRatio 用，2% 偏保守）
+  depth-limit: 100               # 市价单最多吃多少档盘口（IOC/FOK 限价单按限价决定吃多少）
+  ticker-cache-ms: 5000          # 最新价缓存时长，避免一轮评估里反复打行情接口
+  rolling-days: 30               # 状态接口默认展示的滚动年化窗口（天）
+  funding-initial-delay-ms: 30000  # 启动 30 秒后开始结算资金费
+  funding-settle-interval-ms: 60000 # 资金费结算扫描间隔（结算点数据来自历史费率表，幂等）
+  snapshot-initial-delay-ms: 30000  # 启动 30 秒后记第一条净值
+  snapshot-interval-ms: 3600000     # 之后每小时记一条（净值曲线 / 滚动年化的数据源）
+
 # 风控（模块 6）
 risk:
   max-drawdown: 0.05             # 账户权益从峰值回撤 5% → 全平并停止策略
@@ -123,16 +145,20 @@ risk:
   mark-index-deviation-pause: 0.03  # 偏离 3% → 暂停开新仓
   mark-index-deviation-halt: 0.05   # 偏离 5% → 熔断
 
-# 告警（模块 6）。密码属于密钥，只放仓库外的 application-local.yml
+# 告警（模块 6）。
+#   * SMTP 密码是密钥，只放仓库外 ~/.quantification/application-local.yml 的 alert.mail.password。
+#   * 注意：application.yml 的优先级高于外置文件，所以这里【不能】写 password 这一项，
+#     否则空值会盖掉外置文件的真密码（troubleshooting 1.3 已踩过坑）。
 alert:
   mail:
-    enabled: false               # 先关闭；配好 SMTP 后改成 true
-    host: ""
-    port: 465
-    username: ""
-    password: ""
-    from: ""
-    to: ""
+    enabled: true               # 配好 SMTP 后打开
+    host: smtp.qq.com           # QQ 邮箱发信服务器；换服务商改这里
+    port: 465                   # 465 = SSL；用 587 会自动走 STARTTLS
+    username: 421791582@qq.com  # 完整 QQ 邮箱地址（发信账号）
+    from: ""                    # 发件人，留空则等于 username（自己发给自己也可以）
+    to: 421791582@qq.com        # 收件人，多个用英文逗号分隔
+    cooldown-seconds: 300       # 同一告警主题的节流间隔，避免同一事件反复发
+  transient-failures-before-warning: 6   # 连续多少次瞬时网络失败后发提醒（不熔断，仍自动重试）
 
 ---
 # ===== 本地开发环境：连测试库 =====

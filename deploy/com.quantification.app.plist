@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  量化策略应用的自启托管（launchd）。
+  RunAtLoad = 开机自动拉起；KeepAlive = 进程意外退出后自动重启（3 个月无人值守不中断）；
+  ThrottleInterval = 崩溃后至少隔 30 秒再重启；日志落到 logs/app.out.log 与 app.err.log。
+  用法：cp deploy/com.quantification.app.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.quantification.app.plist
+  注意：下面两个路径是这台开发机的绝对路径，换机器/服务器时要改；应用先于 MySQL 启动失败时，KeepAlive 会在 30 秒后自动重试。
+-->
+<dict>
+    <key>Label</key>
+    <string>com.quantification.app</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/chenwu/Library/Java/JavaVirtualMachines/openjdk-24.0.2+12-54/Contents/Home/bin/java</string>
+        <string>-Xmx1g</string>
+        <string>-jar</string>
+        <string>/Users/chenwu/IdeaProjects/quantification/target/quantification-1.0-SNAPSHOT.jar</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/chenwu/IdeaProjects/quantification</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/chenwu/IdeaProjects/quantification/logs/app.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/chenwu/IdeaProjects/quantification/logs/app.err.log</string>
+</dict>
+</plist>

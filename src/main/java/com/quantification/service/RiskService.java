@@ -1,6 +1,7 @@
 package com.quantification.service;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
@@ -38,12 +39,22 @@ public class RiskService {
     /** 账户权益峰值（USD），用于算回撤。 */
     private final AtomicReference<BigDecimal> equityPeak = new AtomicReference<>(BigDecimal.ZERO);
 
+    /** 邮件告警：熔断时发一封通知（发送失败不影响风控）。 */
+    private final MailAlertService mailAlert;
+
+    /** 事件日志：熔断落库，供后台"异常与告警"页展示。 */
+    private final EventLogService eventLog;
+
     public RiskService(@Value("${risk.max-drawdown:0.05}") BigDecimal maxDrawdown,
                        @Value("${risk.mgn-ratio-warn:0.5}") BigDecimal mgnRatioWarn,
-                       @Value("${risk.mgn-ratio-reduce:0.8}") BigDecimal mgnRatioReduce) {
+                       @Value("${risk.mgn-ratio-reduce:0.8}") BigDecimal mgnRatioReduce,
+                       MailAlertService mailAlert,
+                       EventLogService eventLog) {
         this.maxDrawdown = maxDrawdown;
         this.mgnRatioWarn = mgnRatioWarn;
         this.mgnRatioReduce = mgnRatioReduce;
+        this.mailAlert = mailAlert;
+        this.eventLog = eventLog;
     }
 
     /** @return 当前是否熔断 */
@@ -65,6 +76,12 @@ public class RiskService {
         if (halted.compareAndSet(false, true)) {
             haltReason.set(reason);
             log.error("⛔ 触发熔断，停止开新仓。原因：{}", reason);
+            eventLog.log("system", "ERROR", "halt", "触发熔断", reason);
+            mailAlert.send("熔断", "触发熔断，停止开新仓。\n"
+                    + "原因：" + reason + "\n"
+                    + "时间：" + LocalDateTime.now() + "\n"
+                    + "恢复方式：排查原因后重启程序（熔断状态是内存态，重启即清空），"
+                    + "恢复前建议先按【交易所为准】对账确认持仓。");
         }
     }
 

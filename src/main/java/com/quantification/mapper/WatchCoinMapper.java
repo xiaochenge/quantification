@@ -83,4 +83,21 @@ public interface WatchCoinMapper {
      */
     @Update("UPDATE watch_coin SET enabled = 0")
     int disableAll();
+
+    /**
+     * 按币种查篮子记录（不限启用状态）。
+     *
+     * <p>自建 mock 用它取保证金折扣率：模拟持仓里可能有刚被停用的币，
+     * 折扣率仍要能查到，否则有效权益会算成 0。
+     *
+     * @param baseCoin 标的币种，如 BTC
+     * @return 篮子记录；不存在返回 null
+     */
+    @Select("""
+            SELECT id, base_coin, spot_symbol, futures_symbol, futures_category, discount_rate,
+                   real_supported, demo_supported, enabled, note
+            FROM watch_coin
+            WHERE base_coin = #{baseCoin}
+            """)
+    WatchCoin findByBaseCoin(@Param("baseCoin") String baseCoin);
 }

@@ -25,6 +25,23 @@
 - **原因**：profile 文档里的 `password: ${DB_PASSWORD:}` 会在优先级上盖掉外置文件的值。
 - **解决**：把占位符从 `application.yml` 里删掉，密码只留外置文件；环境变量优先级本就高于配置文件。
 
+### 1.4 用 mysql 命令行连库报 `Access denied`（密码是对的）
+
+- **现象**：从 `~/.quantification/application-local.yml` 取出 `password` 直接喂给 `mysql -p...`，
+  一直返回 `ERROR 1045 Access denied`，而程序用同一个配置文件却连得上。
+- **原因**：那个密码在 YAML 里是**带引号的**（`password: "xxxx"`）。Spring 读配置时会自动去掉引号，
+  但手工 `sed` 出来的是 `"xxxx"`，多出来的引号当然认证不过。
+- **解决**：手工取密码时顺手去引号：
+  `sed -n 's/^[[:space:]]*password:[[:space:]]*//p' 文件 | sed -E 's/^["'\'']//; s/["'\'']$//'`。
+- **注意**：命令行连库只用 `MYSQL_PWD` 环境变量传密码，别写进命令历史或脚本。
+
+### 1.5 第一次跑 `./mvnw clean test` 卡在下载 surefire 测试运行器
+
+- **现象**：项目此前没有测试代码，第一次加单元测试后构建失败：
+  `surefire-junit-platform:jar 无法解析（offline mode）`。
+- **原因**：JUnit 平台的 surefire provider 是**按需下载**的，没有测试时永远不会被拉取，本地 `~/.m2` 里没有。
+- **解决**：联网跑一次 `./mvnw clean test`（会下载 `surefire-junit-platform` 与 `junit-platform-*`），之后就离线可用。
+
 ## 2. Bitget 接口
 
 ### 2.1 `40008 请求时间戳过期`

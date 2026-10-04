@@ -51,7 +51,7 @@ public class BitgetPublicClient {
      * @throws BitgetApiException 接口返回非成功码或响应结构异常
      */
     public List<FundingRatePoint> historyFundingRate(String category, String symbol, int limit, int cursor) {
-        BitgetResponse<HistoryData> resp = client.get()
+        BitgetResponse<HistoryData> resp = HttpRetry.call(() -> client.get()
                 .uri(uri -> uri.path("/api/v3/market/history-fund-rate")
                         .queryParam("category", category)
                         .queryParam("symbol", symbol)
@@ -59,7 +59,8 @@ public class BitgetPublicClient {
                         .queryParam("cursor", cursor)
                         .build())
                 .retrieve()
-                .body(new ParameterizedTypeReference<BitgetResponse<HistoryData>>() {});
+                .body(new ParameterizedTypeReference<BitgetResponse<HistoryData>>() {}),
+                "GET /api/v3/market/history-fund-rate");
         if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
             throw new BitgetApiException("history-fund-rate 调用失败: "
                     + (resp == null ? "无响应" : resp.code() + " " + resp.msg()));
@@ -76,13 +77,14 @@ public class BitgetPublicClient {
      * @throws BitgetApiException 接口返回非成功码或响应结构异常
      */
     public List<CurrentFundingRate> currentFundingRate(String category, String symbol) {
-        BitgetResponse<List<CurrentFundingRate>> resp = client.get()
+        BitgetResponse<List<CurrentFundingRate>> resp = HttpRetry.call(() -> client.get()
                 .uri(uri -> uri.path("/api/v3/market/current-fund-rate")
                         .queryParam("category", category)
                         .queryParam("symbol", symbol)
                         .build())
                 .retrieve()
-                .body(new ParameterizedTypeReference<BitgetResponse<List<CurrentFundingRate>>>() {});
+                .body(new ParameterizedTypeReference<BitgetResponse<List<CurrentFundingRate>>>() {}),
+                "GET /api/v3/market/current-fund-rate");
         if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
             throw new BitgetApiException("current-fund-rate 调用失败: "
                     + (resp == null ? "无响应" : resp.code() + " " + resp.msg()));
@@ -118,7 +120,7 @@ public class BitgetPublicClient {
     }
 
     private List<InstrumentInfo> instruments(String category, boolean demo) {
-        BitgetResponse<List<InstrumentInfo>> resp = client.get()
+        BitgetResponse<List<InstrumentInfo>> resp = HttpRetry.call(() -> client.get()
                 .uri(uri -> uri.path("/api/v3/market/instruments")
                         .queryParam("category", category)
                         .build())
@@ -129,7 +131,8 @@ public class BitgetPublicClient {
                     }
                 })
                 .retrieve()
-                .body(new ParameterizedTypeReference<BitgetResponse<List<InstrumentInfo>>>() {});
+                .body(new ParameterizedTypeReference<BitgetResponse<List<InstrumentInfo>>>() {}),
+                "GET /api/v3/market/instruments");
         if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
             throw new BitgetApiException("instruments 调用失败: "
                     + (resp == null ? "无响应" : resp.code() + " " + resp.msg()));
@@ -145,12 +148,13 @@ public class BitgetPublicClient {
      * @throws BitgetApiException 接口返回非成功码或响应结构异常
      */
     public List<Ticker> tickers(String category) {
-        BitgetResponse<List<Ticker>> resp = client.get()
+        BitgetResponse<List<Ticker>> resp = HttpRetry.call(() -> client.get()
                 .uri(uri -> uri.path("/api/v3/market/tickers")
                         .queryParam("category", category)
                         .build())
                 .retrieve()
-                .body(new ParameterizedTypeReference<BitgetResponse<List<Ticker>>>() {});
+                .body(new ParameterizedTypeReference<BitgetResponse<List<Ticker>>>() {}),
+                "GET /api/v3/market/tickers");
         if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
             throw new BitgetApiException("tickers 调用失败: "
                     + (resp == null ? "无响应" : resp.code() + " " + resp.msg()));
@@ -165,10 +169,11 @@ public class BitgetPublicClient {
      * @throws BitgetApiException 接口返回非成功码或响应结构异常
      */
     public List<DiscountRate> discountRates() {
-        BitgetResponse<List<DiscountRate>> resp = client.get()
+        BitgetResponse<List<DiscountRate>> resp = HttpRetry.call(() -> client.get()
                 .uri(uri -> uri.path("/api/v3/market/discount-rate").build())
                 .retrieve()
-                .body(new ParameterizedTypeReference<BitgetResponse<List<DiscountRate>>>() {});
+                .body(new ParameterizedTypeReference<BitgetResponse<List<DiscountRate>>>() {}),
+                "GET /api/v3/market/discount-rate");
         if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
             throw new BitgetApiException("discount-rate 调用失败: "
                     + (resp == null ? "无响应" : resp.code() + " " + resp.msg()));
@@ -206,7 +211,7 @@ public class BitgetPublicClient {
     }
 
     private OrderBook orderBook(String category, String symbol, int limit, boolean demo) {
-        BitgetResponse<OrderBook> resp = client.get()
+        BitgetResponse<OrderBook> resp = HttpRetry.call(() -> client.get()
                 .uri(uri -> uri.path("/api/v3/market/orderbook")
                         .queryParam("category", category)
                         .queryParam("symbol", symbol)
@@ -218,7 +223,8 @@ public class BitgetPublicClient {
                     }
                 })
                 .retrieve()
-                .body(new ParameterizedTypeReference<BitgetResponse<OrderBook>>() {});
+                .body(new ParameterizedTypeReference<BitgetResponse<OrderBook>>() {}),
+                "GET /api/v3/market/orderbook");
         if (resp == null || !OK.equals(resp.code()) || resp.data() == null) {
             throw new BitgetApiException("orderbook 调用失败: "
                     + (resp == null ? "无响应" : resp.code() + " " + resp.msg()));

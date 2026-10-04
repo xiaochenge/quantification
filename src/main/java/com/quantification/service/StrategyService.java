@@ -30,17 +30,20 @@ public class StrategyService {
     private static final Logger log = LoggerFactory.getLogger(StrategyService.class);
 
     private final WatchCoinMapper watchCoinMapper;
+    private final FundingAnalysisService analysisService;
     private final BigDecimal entryNet;
     private final int maxHoldings;
     private final BigDecimal maxSingleWeight;
     private final BigDecimal targetInvestRatio;
 
     public StrategyService(WatchCoinMapper watchCoinMapper,
+                           FundingAnalysisService analysisService,
                            @Value("${strategy.entry-net:0.05}") BigDecimal entryNet,
                            @Value("${strategy.max-holdings:3}") int maxHoldings,
                            @Value("${strategy.max-single-weight:0.40}") BigDecimal maxSingleWeight,
                            @Value("${strategy.target-invest-ratio:0.95}") BigDecimal targetInvestRatio) {
         this.watchCoinMapper = watchCoinMapper;
+        this.analysisService = analysisService;
         this.entryNet = entryNet;
         this.maxHoldings = maxHoldings;
         this.maxSingleWeight = maxSingleWeight;
@@ -54,32 +57,43 @@ public class StrategyService {
      * @param turnover   各交易对的 24h 成交额（用于权重分配）
      * @param tradable   当前运行模式下**真正能交易**的交易对集合（模拟盘与实盘支持范围不同）；
      *                   不在这里过滤的话，决策日志会列出根本下不了单的币（实测踩过）
+     * @param currentSymbols 当前已持有的交易对（恢复轮数过滤只卡"新进"，不卡已持仓，避免反复开平）
      * @return 目标仓位：交易对 → 目标权重（占总资金），空 Map 表示应空仓
      */
     public Map<String, BigDecimal> decideTarget(List<FundingAnalysisService.Candidate> candidates,
                                                Map<String, BigDecimal> turnover,
-                                               Set<String> tradable) {
+                                               Set<String> tradable,
+                                               Set<String> currentSymbols) {
         List<FundingAnalysisService.Candidate> qualified = new ArrayList<>();
         int skippedNotTradable = 0;
+        int skippedByRecovery = 0;
         for (FundingAnalysisService.Candidate candidate : candidates) {
             if (tradable != null && !tradable.contains(candidate.symbol())) {
                 skippedNotTradable++;
                 continue;   // 该币在当前模式下不可交易，直接跳过
             }
-            if (candidate.netAnnualized().compareTo(entryNet) >= 0) {
-                qualified.add(candidate);
-                if (qualified.size() >= maxHoldings) {
-                    break;
-                }
+            if (candidate.netAnnualized().compareTo(entryNet) < 0) {
+                break;      // 候选按净年化降序，后面只会更低，直接停
+            }
+            // 恢复轮数过滤：只对新进候选生效（已持仓的币不重复过滤，避免反复开平）
+            if (currentSymbols != null && !currentSymbols.contains(candidate.symbol())
+                    && !analysisService.recoveryFilterPassed(candidate.symbol())) {
+                skippedByRecovery++;
+                continue;
+            }
+            qualified.add(candidate);
+            if (qualified.size() >= maxHoldings) {
+                break;
             }
         }
         if (qualified.isEmpty()) {
-            log.info("目标仓位：空仓（当前模式下 {} 个币因不可交易被排除，其余未达建仓门槛 净年化 {}）",
-                    skippedNotTradable, percent(entryNet));
+            log.info("目标仓位：空仓（{} 个不可交易被排除，{} 个未过恢复轮数过滤，其余未达建仓门槛 净年化 {}）",
+                    skippedNotTradable, skippedByRecovery, percent(entryNet));
             return Map.of();
         }
-        log.info("目标仓位：从 {} 个可交易候选中选出 {} 个（另有 {} 个币因当前模式不可交易被排除）",
-                tradable == null ? candidates.size() : tradable.size(), qualified.size(), skippedNotTradable);
+        log.info("目标仓位：从 {} 个可交易候选中选出 {} 个（另有 {} 个不可交易、{} 个未过恢复轮数过滤被排除）",
+                tradable == null ? candidates.size() : tradable.size(), qualified.size(),
+                skippedNotTradable, skippedByRecovery);
 
         Map<String, BigDecimal> target = new LinkedHashMap<>();
         BigDecimal turnoverSum = BigDecimal.ZERO;
@@ -109,12 +123,13 @@ public class StrategyService {
      * <p>模拟盘与实盘支持范围不同，标记存在 watch_coin 表里（demo_supported / real_supported），
      * 按模式过滤即可，不需要额外配置。
      *
-     * @param paperTrading true = 模拟盘
+     * @param demoInstruments true = 按官方模拟盘的支持清单过滤（模拟盘只覆盖少数币）；
+     *                        false = 用真实市场支持清单（实盘与自建 mock 都用它）
      * @return 交易对 → 币种信息
      */
-    public Map<String, WatchCoin> enabledCoins(boolean paperTrading) {
+    public Map<String, WatchCoin> enabledCoins(boolean demoInstruments) {
         Map<String, WatchCoin> map = new LinkedHashMap<>();
-        for (WatchCoin coin : watchCoinMapper.findTradable(paperTrading)) {
+        for (WatchCoin coin : watchCoinMapper.findTradable(demoInstruments)) {
             map.put(coin.getFuturesSymbol(), coin);
         }
         return map;

@@ -1,24 +1,27 @@
 package com.quantification.service;
 
-import com.quantification.bitget.BitgetPrivateClient;
 import com.quantification.bitget.BitgetPrivateClient.AccountAssets;
 import com.quantification.bitget.BitgetPrivateClient.AssetCoin;
 import com.quantification.bitget.BitgetPrivateClient.Position;
 import com.quantification.bitget.BitgetPublicClient;
 import com.quantification.bitget.BitgetPublicClient.Ticker;
 import com.quantification.entity.WatchCoin;
+import com.quantification.exchange.ExchangeGateway;
+import com.quantification.exchange.TradeMode;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.ResourceAccessException;
 
 /**
  * 交易循环（模块 3~6 的编排）：定时评估 → 决策 → 执行，并把每一步写进日志。
@@ -29,9 +32,11 @@ import org.springframework.stereotype.Service;
  * <p><b>安全闸</b>：
  * <ul>
  *   <li>{@code strategy.enabled=false} → 只评估、不下单；</li>
- *   <li>实盘（paptrading=false）时还需要 {@code strategy.allow-real-trading=true} 才真下单，
+ *   <li>实盘时还需要 {@code strategy.allow-real-trading=true} 才真下单，
  *       否则只打印"本应下单"的日志。这条专门防"以为在模拟盘、结果下了真单"。</li>
  * </ul>
+ * 模式的判定交给 {@link ExchangeGateway}：官方模拟盘与自建 mock 都不会动用真实资金，
+ * 因此不需要第二道开关；只有 {@code REAL} 模式才要求 {@code allow-real-trading=true}。
  *
  * <p><b>日志约定</b>：每次评估都输出"看到什么 → 决定什么 → 为什么"，即使决定是"什么都不做"。
  */
@@ -40,17 +45,25 @@ public class TradingLoopService {
 
     private static final Logger log = LoggerFactory.getLogger(TradingLoopService.class);
 
-    private final BitgetPrivateClient privateClient;
+    /** 交易网关：实盘 / 官方模拟盘 / 自建 mock。 */
+    private final ExchangeGateway exchange;
     private final BitgetPublicClient publicClient;
     private final FundingAnalysisService analysisService;
     private final StrategyService strategyService;
     private final OrderExecutionService executionService;
     private final RiskService riskService;
+    private final MailAlertService mailAlert;
+    private final EventLogService eventLog;
 
     private final boolean enabled;
     private final boolean allowRealTrading;
     private final BigDecimal targetInvestRatio;
     private final BigDecimal legTolerance;
+    /** 连续多少次瞬时网络失败后发一封提醒（不熔断）。 */
+    private final int transientWarnThreshold;
+
+    /** 连续瞬时网络失败的计数（成功评估一次就清零）。 */
+    private final AtomicInteger transientFailures = new AtomicInteger();
 
     /** 保证同一时刻只有一次评估在跑。 */
     private final ReentrantLock loopLock = new ReentrantLock();
@@ -58,26 +71,32 @@ public class TradingLoopService {
     /** 启动后是否已做过一次对账。 */
     private volatile boolean reconciled = false;
 
-    public TradingLoopService(BitgetPrivateClient privateClient,
+    public TradingLoopService(ExchangeGateway exchange,
                               BitgetPublicClient publicClient,
                               FundingAnalysisService analysisService,
                               StrategyService strategyService,
                               OrderExecutionService executionService,
                               RiskService riskService,
+                              MailAlertService mailAlert,
+                              EventLogService eventLog,
                               @Value("${strategy.enabled:true}") boolean enabled,
                               @Value("${strategy.allow-real-trading:false}") boolean allowRealTrading,
                               @Value("${strategy.target-invest-ratio:0.95}") BigDecimal targetInvestRatio,
-                              @Value("${execution.leg-tolerance:0.005}") BigDecimal legTolerance) {
-        this.privateClient = privateClient;
+                              @Value("${execution.leg-tolerance:0.005}") BigDecimal legTolerance,
+                              @Value("${alert.transient-failures-before-warning:6}") int transientWarnThreshold) {
+        this.exchange = exchange;
         this.publicClient = publicClient;
         this.analysisService = analysisService;
         this.strategyService = strategyService;
         this.executionService = executionService;
         this.riskService = riskService;
+        this.mailAlert = mailAlert;
+        this.eventLog = eventLog;
         this.enabled = enabled;
         this.allowRealTrading = allowRealTrading;
         this.targetInvestRatio = targetInvestRatio;
         this.legTolerance = legTolerance;
+        this.transientWarnThreshold = transientWarnThreshold;
     }
 
     /** 定时评估（默认启动 20 秒后第一次，之后每小时一次）。 */
@@ -90,26 +109,62 @@ public class TradingLoopService {
         }
         try {
             evaluate();
+            transientFailures.set(0);
         } catch (Exception e) {
-            // 循环里任何异常都不能让调度停掉，但要熔断并告警
-            log.error("评估过程异常，触发熔断", e);
-            riskService.halt("评估异常: " + e.getMessage());
+            // 分级：瞬时网络错误不熔断（下个周期自动重试），只有业务/未知错误才熔断。
+            // 否则网络抖一下策略就停到下次重启，无人值守时等于静默失效。
+            if (isTransient(e)) {
+                int failures = transientFailures.incrementAndGet();
+                log.warn("评估遇到瞬时网络错误（连续 {} 次），本次跳过，下个周期自动重试：{}",
+                        failures, e.getMessage());
+                if (failures == transientWarnThreshold) {
+                    mailAlert.send("网络异常（未熔断）",
+                            "连续 " + failures + " 次评估因网络错误失败，策略仍在自动重试、未熔断，"
+                                    + "但请留意网络是否长时间不可用。最近一次错误：" + e.getMessage());
+                }
+            } else {
+                log.error("评估过程异常，触发熔断", e);
+                riskService.halt("评估异常: " + e.getMessage());
+            }
         } finally {
             loopLock.unlock();
         }
     }
 
+    /**
+     * 判断异常是否属于"瞬时网络错误"（这类错误下个周期重试即可，不该熔断）。
+     *
+     * <p>会沿着 cause 链往下找：RestClient 的网络错误包装成 {@link ResourceAccessException}，
+     * 底层通常是 SSL 握手失败 / 连接重置 / 连接超时 / 域名解析失败。
+     *
+     * @param throwable 异常
+     * @return true = 瞬时网络错误；false = 业务错误或未知异常（应熔断）
+     */
+    static boolean isTransient(Throwable throwable) {
+        for (Throwable current = throwable; current != null; current = current.getCause()) {
+            if (current instanceof ResourceAccessException
+                    || current instanceof java.net.ConnectException
+                    || current instanceof java.net.SocketException
+                    || current instanceof javax.net.ssl.SSLException
+                    || current instanceof java.net.UnknownHostException
+                    || current instanceof java.net.SocketTimeoutException) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** 一次完整评估。 */
     public void evaluate() {
-        if (!privateClient.isConfigured()) {
-            log.warn("未配置 Bitget API Key（当前模式 {}），本次只做本地分析",
-                    privateClient.isPaperTrading() ? "模拟盘" : "实盘");
+        if (!exchange.isConfigured()) {
+            log.warn("当前模式（{}）还没有下单能力（未配置 API Key），本次只做本地分析",
+                    exchange.mode().getLabel());
         }
 
         // ---------- 1. 读交易所真实状态（交易所永远是真相）----------
-        AccountAssets assets = privateClient.isConfigured() ? privateClient.assets() : null;
-        List<Position> positions = privateClient.isConfigured()
-                ? privateClient.positions(BitgetPublicClient.USDT_FUTURES, null) : List.of();
+        AccountAssets assets = exchange.isConfigured() ? exchange.assets() : null;
+        List<Position> positions = exchange.isConfigured()
+                ? exchange.positions(BitgetPublicClient.USDT_FUTURES, null) : List.of();
         Map<String, BigDecimal> perpHoldings = new LinkedHashMap<>();
         for (Position position : positions) {
             if (position.total() != null && new BigDecimal(position.total()).signum() > 0) {
@@ -159,9 +214,11 @@ public class TradingLoopService {
         // ---------- 4. 决策 ----------
         Map<String, BigDecimal> turnover = turnoverBySymbol();
         // 只取当前模式（模拟盘/实盘）真正能交易的币，避免对不支持的币下单
-        Map<String, WatchCoin> coins = strategyService.enabledCoins(privateClient.isPaperTrading());
-        Map<String, BigDecimal> target = strategyService.decideTarget(candidates, turnover, coins.keySet());
-        Map<String, BigDecimal> current = currentWeights(equity, coins, spotHoldings, perpHoldings);
+        // 只有官方模拟盘需要按"模拟盘支持清单"过滤；实盘与自建 mock 都用真实市场
+        Map<String, WatchCoin> coins = strategyService.enabledCoins(exchange.mode() == TradeMode.DEMO);
+        // 先算当前持仓：恢复轮数过滤只卡"新进"，已持仓的币不重复过滤（避免反复开平）
+        Map<String, BigDecimal> current = currentWeights(equity, spotHoldings, perpHoldings);
+        Map<String, BigDecimal> target = strategyService.decideTarget(candidates, turnover, coins.keySet(), current.keySet());
 
         log.info("决策：当前持仓 {} | 目标仓位 {}", render(current), render(target));
         if (current.keySet().equals(target.keySet())) {
@@ -170,10 +227,10 @@ public class TradingLoopService {
         }
 
         // ---------- 5. 执行 ----------
-        boolean canTrade = enabled && (privateClient.isPaperTrading() || allowRealTrading);
+        boolean canTrade = enabled && (exchange.mode().isSimulated() || allowRealTrading);
         if (!canTrade) {
-            log.warn("结论：本应调仓，但下单被安全闸拦住（enabled={}，模拟盘={}，允许实盘={}）",
-                    enabled, privateClient.isPaperTrading(), allowRealTrading);
+            log.warn("结论：本应调仓，但下单被安全闸拦住（enabled={}，模式={}，允许实盘={}）",
+                    enabled, exchange.mode().getLabel(), allowRealTrading);
             return;
         }
 
@@ -184,7 +241,10 @@ public class TradingLoopService {
             }
             WatchCoin coin = coins.get(entry.getKey());
             if (coin == null) {
-                continue;
+                // 该币已掉出监控篮子（成交额/折扣率掉出门槛）但仍持仓：照样平掉，
+                // 绝不能留成孤儿仓位——否则资金被锁死，新仓永远建不起来。
+                log.warn("调仓：{} 已掉出篮子但仍持仓，按平仓处理", entry.getKey());
+                coin = orphanCoin(entry.getKey());
             }
             log.info("调仓：平掉 {}（不在目标仓位里）", coin.getBaseCoin());
             executionService.closePosition(coin,
@@ -234,6 +294,9 @@ public class TradingLoopService {
         for (Map.Entry<String, BigDecimal> entry : perpHoldings.entrySet()) {
             log.warn("对账发现交易所已有合约持仓 {} {}：按【交易所为准】原则接管，后续按目标仓位处理",
                     entry.getKey(), entry.getValue().toPlainString());
+            eventLog.log("system", "WARN", "reconcile",
+                    "启动对账接管已有持仓 " + entry.getKey(),
+                    "数量 " + entry.getValue().toPlainString());
         }
         if (perpHoldings.isEmpty() && spotHoldings.isEmpty()) {
             log.info("启动对账：当前空仓，从零开始");
@@ -255,29 +318,56 @@ public class TradingLoopService {
         return map;
     }
 
-    /** 把交易所的真实持仓换算成"占账户权益的权重"。 */
-    private Map<String, BigDecimal> currentWeights(BigDecimal equity, Map<String, WatchCoin> coins,
-                                                   Map<String, BigDecimal> spotHoldings,
+    /**
+     * 把交易所的真实持仓换算成"占账户权益的权重"。
+     *
+     * <p>遍历的是交易所的<b>全部</b>永续持仓，而不是只遍历篮子——这样"已掉出篮子但仍持仓"
+     * 的孤儿仓位也会被看见，进而在下次调仓时被平掉。
+     */
+    private Map<String, BigDecimal> currentWeights(BigDecimal equity, Map<String, BigDecimal> spotHoldings,
                                                    Map<String, BigDecimal> perpHoldings) {
         Map<String, BigDecimal> weights = new LinkedHashMap<>();
         if (equity.signum() <= 0) {
             return weights;
         }
-        for (Map.Entry<String, WatchCoin> entry : coins.entrySet()) {
-            WatchCoin coin = entry.getValue();
-            BigDecimal perp = perpHoldings.get(coin.getFuturesSymbol());
-            BigDecimal spot = spotHoldings.get(coin.getBaseCoin());
-            if (perp == null || perp.signum() <= 0 || spot == null || spot.signum() <= 0) {
+        for (Map.Entry<String, BigDecimal> entry : perpHoldings.entrySet()) {
+            String symbol = entry.getKey();
+            BigDecimal perp = entry.getValue();
+            if (perp.signum() <= 0) {
+                continue;
+            }
+            BigDecimal spot = spotHoldings.getOrDefault(baseCoinOf(symbol), BigDecimal.ZERO);
+            if (spot.signum() <= 0) {
                 continue;
             }
             // 权重用合约腿的名义价值近似（两腿本该等值）
-            BigDecimal price = lastPrice(coin.getFuturesSymbol());
+            BigDecimal price = lastPrice(symbol);
             if (price.signum() <= 0) {
                 continue;
             }
-            weights.put(entry.getKey(), perp.multiply(price).divide(equity, 8, RoundingMode.HALF_UP));
+            weights.put(symbol, perp.multiply(price).divide(equity, 8, RoundingMode.HALF_UP));
         }
         return weights;
+    }
+
+    /** USDT 计价交易对里，把 "BTCUSDT" 还原成基础币 "BTC"。 */
+    private static String baseCoinOf(String symbol) {
+        return symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4) : symbol;
+    }
+
+    /**
+     * 给"已不在篮子里但仍有持仓"的币拼一个最小 {@link WatchCoin}，好让它走平仓逻辑。
+     *
+     * <p>现货与永续的交易对符号在 USDT 计价下相同（如 FARTCOINUSDT），
+     * 所以这里两条腿都用同一个符号即可。
+     */
+    private static WatchCoin orphanCoin(String futuresSymbol) {
+        WatchCoin coin = new WatchCoin();
+        coin.setBaseCoin(baseCoinOf(futuresSymbol));
+        coin.setSpotSymbol(futuresSymbol);
+        coin.setFuturesSymbol(futuresSymbol);
+        coin.setFuturesCategory(BitgetPublicClient.USDT_FUTURES);
+        return coin;
     }
 
     private BigDecimal lastPrice(String symbol) {

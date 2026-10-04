@@ -47,6 +47,7 @@ public class BitgetPrivateClient {
 
     public BitgetPrivateClient(@Value("${bitget.base-url:https://api.bitget.com}") String baseUrl,
                                @Value("${bitget.paptrading:false}") boolean paptrading,
+                               @Value("${simulation.enabled:false}") boolean simulationEnabled,
                                @Value("${bitget.api-key:}") String realApiKey,
                                @Value("${bitget.secret-key:}") String realSecretKey,
                                @Value("${bitget.passphrase:}") String realPassphrase,
@@ -61,8 +62,12 @@ public class BitgetPrivateClient {
         this.demoApiKey = demoApiKey;
         this.demoSecretKey = demoSecretKey;
         this.demoPassphrase = demoPassphrase;
-        // 启动时把模式打到日志，避免"以为在模拟盘、实际在实盘"
-        if (paptrading) {
+        // 启动时把模式打到日志，避免"以为在模拟盘、实际在实盘"。
+        // 自建 mock 模式下本类根本不会被调用（RealExchangeGateway 才用它），
+        // 所以这里要明确说明，避免和"官方模拟盘"混淆。
+        if (simulationEnabled) {
+            log.info("自建 mock 模式：私有客户端不会被调用（不碰实盘、也不碰官方模拟盘账户）");
+        } else if (paptrading) {
             log.info("Bitget 运行在【模拟盘】模式（paptrading=1，虚拟资金），不会动到真实资金");
         } else {
             log.info("Bitget 运行在【实盘】模式，下单会真实成交");

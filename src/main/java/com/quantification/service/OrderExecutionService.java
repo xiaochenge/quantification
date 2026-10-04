@@ -1,11 +1,11 @@
 package com.quantification.service;
 
-import com.quantification.bitget.BitgetPrivateClient;
 import com.quantification.bitget.BitgetPublicClient;
 import com.quantification.bitget.BitgetPublicClient.InstrumentInfo;
 import com.quantification.bitget.BitgetPublicClient.OrderBook;
 import com.quantification.entity.WatchCoin;
 import com.quantification.entity.Instrument;
+import com.quantification.exchange.ExchangeGateway;
 import com.quantification.mapper.InstrumentMapper;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -27,6 +27,9 @@ import org.springframework.stereotype.Service;
  *   <li><b>滑点</b>：用 IOC 限价单，价格 = 盘口最优价 ± 滑点上限，超上限就不下；</li>
  *   <li><b>两腿</b>：现货与合约同时发起；腿差超过容差则补小腿，补不齐就把大腿减到对齐。</li>
  * </ol>
+ *
+ * <p><b>下单落到哪里</b>由 {@link ExchangeGateway} 决定（实盘 / 官方模拟盘 / 自建 mock），
+ * 本类不区分模式——这正是"用同一套代码验证策略收益"的关键。
  */
 @Service
 public class OrderExecutionService {
@@ -36,7 +39,10 @@ public class OrderExecutionService {
     private static final int CLIENT_OID_BASE = 36;
 
     private final BitgetPublicClient publicClient;
-    private final BitgetPrivateClient privateClient;
+    /** 交易网关：实盘、官方模拟盘、自建 mock 三种模式下走同一个接口。 */
+    private final ExchangeGateway exchange;
+    /** 事件日志：下单失败落库，供后台"异常与告警"页展示。 */
+    private final EventLogService eventLog;
     /** 下单规则来自数据库（定时同步），绝不临时猜或临时查。 */
     private final InstrumentMapper instrumentMapper;
 
@@ -60,7 +66,8 @@ public class OrderExecutionService {
     private final BigDecimal priceBuffer;
 
     public OrderExecutionService(BitgetPublicClient publicClient,
-                                 BitgetPrivateClient privateClient,
+                                 ExchangeGateway exchange,
+                                 EventLogService eventLog,
                                  InstrumentMapper instrumentMapper,
                                  @Value("${execution.slippage-limit-major:0.0005}") BigDecimal slippageMajor,
                                  @Value("${execution.slippage-limit-small:0.0015}") BigDecimal slippageSmall,
@@ -70,7 +77,8 @@ public class OrderExecutionService {
                                  @Value("${execution.leg-tolerance:0.005}") BigDecimal legTolerance,
                                  @Value("${execution.price-buffer:0.01}") BigDecimal priceBuffer) {
         this.publicClient = publicClient;
-        this.privateClient = privateClient;
+        this.exchange = exchange;
+        this.eventLog = eventLog;
         this.instrumentMapper = instrumentMapper;
         this.slippageMajor = slippageMajor;
         this.slippageSmall = slippageSmall;
@@ -205,7 +213,7 @@ public class OrderExecutionService {
                 break;
             }
             try {
-                var info = privateClient.orderInfo(null, clientOid);
+                var info = exchange.orderInfo(null, clientOid);
                 if (info != null) {
                     // 反查结果必须打出来：状态 / 委托量 / 实际成交量 / 均价，
                     // 否则事后无法判断"为什么这腿没成交"
@@ -332,10 +340,12 @@ public class OrderExecutionService {
         }
         fields.put("clientOid", clientOid);
         try {
-            privateClient.placeOrder(fields);
+            exchange.placeOrder(fields);
             return true;
         } catch (Exception e) {
             log.error("下单失败 {} {} qty={} price={}：{}", category, symbol, qty, price, e.getMessage());
+            eventLog.log("system", "ERROR", "order", "下单失败 " + category + " " + symbol,
+                    "qty=" + qty + " price=" + price + "：" + e.getMessage());
             return false;
         }
     }
@@ -349,7 +359,7 @@ public class OrderExecutionService {
         fields.put("qty", qty);
         fields.put("clientOid", clientOid(symbol, "spot-rollback"));
         try {
-            privateClient.placeOrder(fields);
+            exchange.placeOrder(fields);
             return true;
         } catch (Exception e) {
             log.error("回退卖出现货失败 {} qty={}：{}", symbol, qty, e.getMessage());
@@ -367,7 +377,7 @@ public class OrderExecutionService {
         fields.put("posSide", "short");
         fields.put("clientOid", clientOid(symbol, "perp-rollback"));
         try {
-            privateClient.placeOrder(fields);
+            exchange.placeOrder(fields);
             return true;
         } catch (Exception e) {
             log.error("回退买回合约失败 {} qty={}：{}", symbol, qty, e.getMessage());
