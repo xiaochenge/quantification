@@ -269,15 +269,15 @@ const app = createApp({
           <el-alert v-if="overview && overview.halted" :title="'已熔断：' + overview.haltReason"
                     type="error" :closable="false" style="margin-top:12px" />
           <div class="metric" style="margin-top:16px">
-            <div class="item"><div class="label">账户总权益(USDT)</div><div class="value">{{ money(overview?.accountEquity) }}</div></div>
-            <div class="item"><div class="label">有效权益(USDT)</div><div class="value">{{ money(overview?.effEquity) }}</div></div>
-            <div class="item"><div class="label">维持保证金率</div><div class="value">{{ pct(overview?.mgnRatio) }}</div></div>
-            <div class="item"><div class="label">仓位名义价值</div><div class="value">{{ money(overview?.positionValue) }}</div></div>
-            <div class="item"><div class="label">持仓币种数</div><div class="value">{{ overview?.holdingsCount ?? '-' }}</div></div>
-            <div class="item"><div class="label">累计资金费</div><div class="value">{{ money(overview?.fundingIncome) }}</div></div>
-            <div class="item"><div class="label">累计手续费</div><div class="value">{{ money(overview?.feeCost) }}</div></div>
-            <div class="item"><div class="label">累计收益率</div><div class="value">{{ pct(overview?.cumulativeReturn) }}</div></div>
-            <div class="item"><div class="label">滚动年化</div><div class="value">{{ pct(overview?.rollingAnnualized) }}</div></div>
+            <div class="item"><div class="label">账户总权益(USDT)</div><div class="value">{{ money(overview?.accountEquity) }}</div><div class="hint">现金 + 现货市值 + 合约浮盈亏（真实净值）</div></div>
+            <div class="item"><div class="label">有效权益(USDT)</div><div class="value">{{ money(overview?.effEquity) }}</div><div class="hint">把现货按折扣率折算后，真正能当保证金的净值</div></div>
+            <div class="item"><div class="label">维持保证金率</div><div class="value">{{ pct(overview?.mgnRatio) }}</div><div class="hint">维持保证金 ÷ 有效权益，越接近 100% 越危险</div></div>
+            <div class="item"><div class="label">仓位名义价值</div><div class="value">{{ money(overview?.positionValue) }}</div><div class="hint">所有永续空头的名义价值合计</div></div>
+            <div class="item"><div class="label">持仓币种数</div><div class="value">{{ overview?.holdingsCount ?? '-' }}</div><div class="hint">当前持有的对冲组合个数</div></div>
+            <div class="item"><div class="label">累计资金费</div><div class="value">{{ money(overview?.fundingIncome) }}</div><div class="hint">开跑以来收到的资金费合计（正=赚）</div></div>
+            <div class="item"><div class="label">累计手续费</div><div class="value">{{ money(overview?.feeCost) }}</div><div class="hint">开跑以来付出的手续费合计</div></div>
+            <div class="item"><div class="label">累计收益率</div><div class="value">{{ pct(overview?.cumulativeReturn) }}</div><div class="hint">当前权益 ÷ 初始资金 − 1</div></div>
+            <div class="item"><div class="label">滚动年化</div><div class="value">{{ pct(overview?.rollingAnnualized) }}</div><div class="hint">按净值曲线滚动 30 天折算，跑满 1 天才出数</div></div>
           </div>
           <div style="margin-top:12px;color:#8492a6;font-size:12px">
             订单 {{ overview?.orderCount ?? 0 }} 笔 · 成交 {{ overview?.fillCount ?? 0 }} 笔 ·
@@ -287,15 +287,15 @@ const app = createApp({
         <div class="card" v-if="pnl">
           <h3 style="margin-top:0">盈亏核算（损耗分解）</h3>
           <div class="metric">
-            <div class="item"><div class="label">初始资金</div><div class="value">{{ money(pnl.initialUsdt) }}</div></div>
-            <div class="item"><div class="label">当前权益</div><div class="value">{{ money(pnl.equity) }}</div></div>
-            <div class="item"><div class="label">权益变动</div><div class="value">{{ money(pnl.equity - pnl.initialUsdt) }}</div></div>
-            <div class="item"><div class="label">手续费</div><div class="value" style="color:#e6a23c">−{{ money(pnl.feeCost) }}</div></div>
-            <div class="item"><div class="label">资金费</div><div class="value" style="color:#67c23a">+{{ money(pnl.fundingIncome) }}</div></div>
-            <div class="item"><div class="label">现货已实现</div><div class="value">{{ money(pnl.spotRealized) }}</div></div>
-            <div class="item"><div class="label">永续已实现</div><div class="value">{{ money(pnl.perpRealized) }}</div></div>
-            <div class="item"><div class="label">未实现</div><div class="value">{{ money(pnl.unrealized) }}</div></div>
-            <div class="item"><div class="label">校验残差</div><div class="value" :title="'应接近 0（舍入误差）'">{{ num(pnl.residual, 6) }}</div></div>
+            <div class="item"><div class="label">初始资金</div><div class="value">{{ money(pnl.initialUsdt) }}</div><div class="hint">第一期投入的模拟本金</div></div>
+            <div class="item"><div class="label">当前权益</div><div class="value">{{ money(pnl.equity) }}</div><div class="hint">现在的账户总权益</div></div>
+            <div class="item"><div class="label">权益变动</div><div class="value">{{ money(pnl.equity - pnl.initialUsdt) }}</div><div class="hint">当前权益 − 初始资金，等于下面各项之和</div></div>
+            <div class="item"><div class="label">手续费</div><div class="value" style="color:#e6a23c">−{{ money(pnl.feeCost) }}</div><div class="hint">累计付出的手续费（成本，拖累收益）</div></div>
+            <div class="item"><div class="label">资金费</div><div class="value" style="color:#67c23a">+{{ money(pnl.fundingIncome) }}</div><div class="hint">累计收到的资金费（策略的收益来源）</div></div>
+            <div class="item"><div class="label">现货已实现</div><div class="value">{{ money(pnl.spotRealized) }}</div><div class="hint">已经平掉的现货腿，赚/亏多少</div></div>
+            <div class="item"><div class="label">永续已实现</div><div class="value">{{ money(pnl.perpRealized) }}</div><div class="hint">已经平掉的合约空头，赚/亏多少</div></div>
+            <div class="item"><div class="label">未实现</div><div class="value">{{ money(pnl.unrealized) }}</div><div class="hint">当前还持有的仓位浮盈亏（现货浮盈 + 合约浮亏 的净额）</div></div>
+            <div class="item"><div class="label">校验残差</div><div class="value">{{ num(pnl.residual, 6) }}</div><div class="hint">权益变动 − 各项之和，应为 0（只差舍入误差）</div></div>
           </div>
           <div style="margin-top:8px;color:#8492a6;font-size:12px">
             恒等式：权益变动 = 资金费 − 手续费 + 现货已实现 + 永续已实现 + 未实现；残差应接近 0。
