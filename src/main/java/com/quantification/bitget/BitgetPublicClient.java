@@ -36,8 +36,10 @@ public class BitgetPublicClient {
     /**
      * @param baseUrl Bitget 接口地址，默认 https://api.bitget.com
      */
-    public BitgetPublicClient(@Value("${bitget.base-url:https://api.bitget.com}") String baseUrl) {
-        this.client = RestClient.builder().baseUrl(baseUrl).build();
+    public BitgetPublicClient(@Value("${bitget.base-url:https://api.bitget.com}") String baseUrl,
+                              @Value("${bitget.connect-timeout-ms:5000}") int connectTimeoutMs,
+                              @Value("${bitget.read-timeout-ms:10000}") int readTimeoutMs) {
+        this.client = RestClientFactory.create(baseUrl, connectTimeoutMs, readTimeoutMs);
     }
 
     /**

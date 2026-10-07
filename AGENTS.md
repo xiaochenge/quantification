@@ -225,9 +225,9 @@ com.quantification
 | --- | --- | --- |
 | `spring.config.import` | `~/.quantification/application-local.yml` | **密钥从这里加载**（仓库外） |
 | `spring.web.resources.cache` | `no-store: true` | 后台静态页不缓存 |
-| `bitget` | `paptrading: false` | 当前用不到（mock 模式不走私有客户端） |
-| `watch-coin` | `min-turnover: 5000000`、`min-discount-rate: 0.8` | 目标币种池门槛 |
-| `strategy` | `enabled`、`allow-real-trading`、`entry-net: 0.05`、`max-holdings: 3`、`max-single-weight: 0.40`、`target-invest-ratio: 0.95`、`lookback-days: 10`、`recovery-filter: true` | 策略参数 |
+| `bitget` | `paptrading: false`、`connect-timeout-ms: 5000`、`read-timeout-ms: 10000` | `paptrading` 当前用不到（mock 模式不走私有客户端）；**HTTP 超时是 2026-10-07 加的**，防"对端连接半开 → 本地读永久挂起 → 占死锁 / 请求线程"这类故障 |
+| `watch-coin` | `min-turnover: 20000000`、`min-discount-rate: 0.8` | 目标币种池门槛。**成交额 2026-10-07 从 500 万提到 2000 万**（实测薄盘币买卖价差极宽，PUMP 建仓时腿间价差吃到 0.28%）；提到 2000 万后篮子从 33 个降到 14 个 |
+| `strategy` | `enabled`、`allow-real-trading`、`entry-net: 0.05`、`max-holdings: 3`、`max-single-weight: 0.40`、`target-invest-ratio: 0.95`、`lookback-days: 10`、`recovery-filter: true`、`switch-gap: 0.10`、`min-holding-days: 7` | 策略参数。**`switch-gap` 2026-10-07 从 4 个点提到 10 个点、并新增 `min-holding-days: 7`**（理由见第 11 节） |
 | `execution` | `price-buffer`、`leg-tolerance`、`slippage-limit-major/small`、`major-turnover`、`min-order-notional`、`depth-limit` | 执行参数 |
 | `simulation` | `enabled: true`、`initial-usdt: 30000`、`maintenance-margin-rate: 0.02`、`depth-limit`、`ticker-cache-ms`、`rolling-days: 30`、资金费结算/快照间隔 | **自建 mock 开关与参数** |
 | `host-monitor` | `sample-interval-ms: 60000`、`disk-path: /` | 主机监控采样 |
@@ -235,6 +235,7 @@ com.quantification
 | `risk` | `max-drawdown: 0.05`、`mgn-ratio-warn: 0.5`、`mgn-ratio-reduce: 0.8` | 风控阈值 |
 | `alert.mail` | `enabled: true`、`host: smtp.qq.com`、`port: 465`、`username/to: 421791582@qq.com`、`cooldown-seconds: 300` | 邮件告警（**密码在仓库外**） |
 | `alert.transient-failures-before-warning` | `6` | 连续多少次瞬时网络失败后发提醒（不熔断） |
+| `alert.watchdog` | `enabled: true`、`check-interval-ms: 300000`、`stale-ms: 9000000`、`remind-ms: 3600000` | **看门狗（2026-10-07 新增）**：专盯"程序还活着但什么都不干"的沉默型故障——策略循环每跑完一轮打一次心跳，超过 2.5 小时没心跳就发邮件（一直没恢复每小时再提醒，恢复后补一封恢复通知）。用独立守护线程，不占 Spring 定时任务线程池 |
 
 ## 9. 管理后台（模块 10）
 
@@ -268,13 +269,18 @@ com.quantification
 1. **窗口**：10 天（`strategy.lookback-days`），窗口内每次结算的费率**正负累加**取平均；
 2. **毛年化** = 平均每期费率 ×（365×24 ÷ 该币实际结算周期 h）；**净年化 = 毛年化 − 换仓成本年化**；
    换仓成本 = 2 × (现货 0.06% + 合约 0.0375%) × 365/45 ≈ **1.58%/年**；
-3. **可交易**：必须在本轮**篮子**里（`watch_coin.enabled=1`：现货+永续都有、24h 成交额 ≥500 万、折扣率 ≥0.8）；
+3. **可交易**：必须在本轮**篮子**里（`watch_coin.enabled=1`：现货+永续都有、24h 成交额 ≥2000 万、折扣率 ≥0.8）；
 4. **恢复轮数过滤**：要求"当前连续为正轮数 > 该币历史从负恢复到正的平均轮数"——**只卡新进**，不卡已持仓；
 5. **建仓门槛**：净年化 ≥ `strategy.entry-net`（当前 **0.05**），不达标宁可空仓；
-6. **取前 N**（`max-holdings=3`，按净年化降序），**按 24h 成交额加权**，单币 ≤40%，总投入 ≤95%。
+6. **目标名单**（2026-10-07 起的换仓纪律，见 `StrategyService.decideTarget`）：
+   ① 还拿得住的持仓先保住（只保留净年化最高的 `max-holdings` 个）；
+   ② 有空位就补最好的新币（加仓，不需门槛）；
+   ③ 满仓后新币必须比"最差且已满 `min-holding-days` 的持仓"高出 `switch-gap` 才换。
+   然后 **按 24h 成交额加权**，单币 ≤40%，总投入 ≤95%。
+   掉出篮子 / 净年化跌破 `entry-net` 的持仓**不受滞回与最短持有期保护**，照常强制平仓。
 
 > 注意：**当前策略不使用"当前实时费率"选币**，用的是 10 天窗口；单日冲高不作为依据。
-> 也**没有实现 `switch-gap` 滞回**（见第 11 节）。
+> `switch-gap` 滞回与最短持有期已实现（见第 11 节）；**还没有实现"只调权重不换腿"的再平衡**。
 
 ### 10.2 执行（`OrderExecutionService`）
 
@@ -299,7 +305,7 @@ com.quantification
 
 | 配置项 | 现状 |
 | --- | --- |
-| `strategy.switch-gap`（换仓滞回 4 个点） | **未实现**——`StrategyService` 只做"净年化门槛 + 取前 N"，没有"候选比最差持仓高 4 个点才换"的滞回 |
+| `strategy.switch-gap` + `strategy.min-holding-days` | **已实现（2026-10-07）**——`StrategyService.decideTarget` 的三段纪律：① 还拿得住的持仓先保住（只保留最好的 `max-holdings` 个）；② 有空位就补最好的新币（加仓，不需门槛）；③ 满仓后新币必须比"最差**且已满 `min-holding-days`** 的持仓"高出 `switch-gap` 才换。**换仓成本的实测换算（务必记住）：每交易 1 USDT 名义额摩擦成本 ≈ 0.0953%（手续费 0.0487% + 买卖价差/基差 0.0466%），一次完整换仓（平旧+开新）≈ 持仓名义额的 0.19%**；所以 4 个点要持有约 17 天才回本。现取 `switch-gap: 0.10`（≈7 天回本）+ `min-holding-days: 7` 配套 |
 | `execution.order-timeout-ms`、`execution.max-retries` | **未使用**（执行走的是 FOK + 成交反查，没有超时重下） |
 | `risk.position-watch-interval-ms`、`risk.mark-index-deviation-*` | **未使用**——设计里的"每 5 秒轮询爆仓/ADL"和"标记价偏离"都还没实现 |
 | `risk.max-drawdown` | 已用于熔断判断，但**没有实现"回撤触发即全平"**（只停新仓） |
@@ -308,6 +314,9 @@ com.quantification
 其他固有限制：
 
 - mock 的简化项见 3.3；
+- **最短持有期只在 mock 生效**：`ExchangeGateway.positionOpenedAt()` 默认返回空 Map，
+  实盘 / 官方模拟盘拿不到开仓时间，此时该纪律自动不生效（拿不到就不限制，避免把仓位永久锁死）；
+  将来做实盘要把开仓时间补上；
 - **资金费有滞后**：结算点数据来自历史费率（每 1 小时采一次），资金费入账最多滞后约 1 小时；
 - **可能漏结**：若某币掉出篮子前最后一段结算点始终没采到会漏（已在平仓前加"补拉费率"缓解）。
 
@@ -343,7 +352,7 @@ com.quantification
 
 1. **下单 / 换仓逻辑**（下一阶段重点，见第 15 节）；
 2. 模块 8 完整盈亏核算（按"一组仓位"结算、滚动年化、归因、基准）；
-3. `strategy.switch-gap` 滞回未实现（见第 11 节）；
+3. `strategy.switch-gap` 滞回**已实现（2026-10-07）**（见第 11 节）；剩下的相关缺口是"只调权重不换腿"的再平衡，以及门槛取值是否匹配实际持有期（实测 4 个点≈17 天回本，而实际持仓只有 1~3 天）；
 4. 实盘路径的订单落库与状态机；
 5. `risk` 的 5 秒持仓轮询 / 标记价偏离未实现；
 6. 下架公告监控；
@@ -365,8 +374,8 @@ com.quantification
 
 改动要点提醒：
 
-- 换仓目前是"平掉不在目标里的、建目标里的"，**没有 `switch-gap` 滞回**，
-  也没有"只调权重不换腿"的再平衡；
+- 换仓是"平掉不在目标里的、建目标里的"；**`switch-gap` 滞回已于 2026-10-07 实现**
+  （保留持仓 → 补空位 → 满仓才比价换），但**还没有"只调权重不换腿"的再平衡**；
 - 每次换仓的成本都是真实的（手续费 + 基差/滑点），改完要用 mock 观察 `/api/admin/pnl`
   的分解是否合理；
 - 改完必须 `./mvnw clean test` 通过，并重新 `package` + 重启 launchd 服务。
@@ -379,7 +388,7 @@ com.quantification
 
 ### 3. 补齐缺口
 
-`strategy.switch-gap`、实盘订单落库、`risk` 的轮询与标记价偏离（见第 11 节）。
+实盘订单落库、`risk` 的轮询与标记价偏离（见第 11 节）；以及"只调权重不换腿"的再平衡。
 
 ## 16. 写代码前必读
 

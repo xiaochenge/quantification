@@ -101,4 +101,17 @@ public interface ExchangeGateway {
     default void settleFunding() {
         // 默认空实现：真实交易所会自己结算
     }
+
+    /**
+     * 各交易对的建仓时间（键为永续交易对，如 BTCUSDT），供"最短持有期"这类按时间判断的纪律使用。
+     *
+     * <p>默认返回空 Map：实盘 / 官方模拟盘暂时拿不到开仓时间，此时"最短持有期"自动不生效。
+     * 这里刻意选择"拿不到就不限制"，而不是"拿不到就禁止换仓"——否则会把仓位永久锁死，
+     * 比多换一次仓危险得多。
+     *
+     * @return 交易对 → 建仓时间（当前模式下取不到时为空 Map）
+     */
+    default Map<String, java.time.LocalDateTime> positionOpenedAt() {
+        return Map.of();
+    }
 }

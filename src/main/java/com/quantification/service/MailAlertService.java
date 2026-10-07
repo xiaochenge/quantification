@@ -137,6 +137,11 @@ public class MailAlertService {
         mailSender.setDefaultEncoding("UTF-8");
         Properties props = mailSender.getJavaMailProperties();
         props.put("mail.smtp.auth", "true");
+        // 发信同样必须有超时：没有超时的 SMTP 连接一旦被对端半开，调用线程会永远挂住。
+        // 看门狗就靠这条线程发告警，它自己被挂住就等于告警失效。
+        props.put("mail.smtp.connectiontimeout", "10000");
+        props.put("mail.smtp.timeout", "10000");
+        props.put("mail.smtp.writetimeout", "10000");
         // 465 走 SSL，其余端口（如 587）走 STARTTLS
         if (port == 465) {
             props.put("mail.smtp.ssl.enable", "true");

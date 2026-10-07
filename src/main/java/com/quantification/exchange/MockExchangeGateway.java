@@ -142,11 +142,16 @@ public class MockExchangeGateway implements ExchangeGateway {
     /** 各币持仓（内存态，落库对应 mock_position）。 */
     private final Map<String, Holding> holdings = new LinkedHashMap<>();
 
-    /** 最新价缓存（一次请求拿全部永续交易对）。 */
-    private Map<String, BigDecimal> tickerCache = Map.of();
+    /**
+     * 最新价缓存（一次请求拿全部永续交易对）。
+     *
+     * <p>{@code volatile}：只在 {@link #priceSnapshot()} 里刷新，可能被多个线程读到。
+     * 这里追求的是"读到一个完整的旧快照"，不追求完全互斥（重复刷新一次无害）。
+     */
+    private volatile Map<String, BigDecimal> tickerCache = Map.of();
 
     /** 最新价缓存时间（毫秒）。 */
-    private long tickerCacheAt = 0L;
+    private volatile long tickerCacheAt = 0L;
 
     public MockExchangeGateway(BitgetPublicClient publicClient,
                                InstrumentMapper instrumentMapper,
@@ -234,6 +239,8 @@ public class MockExchangeGateway implements ExchangeGateway {
      */
     @Override
     public AccountAssets assets() {
+        // 取价是网络调用，必须在锁外完成（见 priceSnapshot 注释）
+        Map<String, BigDecimal> prices = priceSnapshot();
         synchronized (lock) {
             BigDecimal spotValue = BigDecimal.ZERO;
             BigDecimal effSpotValue = BigDecimal.ZERO;
@@ -244,7 +251,7 @@ public class MockExchangeGateway implements ExchangeGateway {
             coins.add(new AssetCoin(COIN, plain(cash), plain(cash), plain(cash)));
 
             for (Holding h : holdings.values()) {
-                BigDecimal price = lastPrice(h.futuresSymbol);
+                BigDecimal price = priceOf(prices, h.futuresSymbol);
                 BigDecimal spot = h.spotQty.multiply(price);
                 BigDecimal pnl = h.unrealisedPnl(price);
                 BigDecimal notional = h.perpQty.multiply(price);
@@ -271,6 +278,8 @@ public class MockExchangeGateway implements ExchangeGateway {
     /** @return 模拟持仓（只返回永续空头，与实盘查询口径一致） */
     @Override
     public List<Position> positions(String category, String symbol) {
+        // 取价是网络调用，必须在锁外完成（见 priceSnapshot 注释）
+        Map<String, BigDecimal> prices = priceSnapshot();
         synchronized (lock) {
             List<Position> result = new ArrayList<>();
             if (!BitgetPublicClient.USDT_FUTURES.equals(category)) {
@@ -283,7 +292,7 @@ public class MockExchangeGateway implements ExchangeGateway {
                 if (symbol != null && !symbol.isBlank() && !symbol.equals(h.futuresSymbol)) {
                     continue;
                 }
-                BigDecimal price = lastPrice(h.futuresSymbol);
+                BigDecimal price = priceOf(prices, h.futuresSymbol);
                 result.add(new Position(h.futuresSymbol, "short", plain(h.perpQty), plain(h.perpQty),
                         plain(h.perpAvgPrice), plain(h.unrealisedPnl(price)), "1", "crossed"));
             }
@@ -360,12 +369,20 @@ public class MockExchangeGateway implements ExchangeGateway {
             return new OrderResult("mock-" + clientOid, clientOid);
         }
 
+        // 下面两件事都是网络调用，必须在锁外做（见 priceSnapshot 注释）。
+        // 平空（买回永续）前先补拉该币最近的历史费率：否则"币掉出篮子后最后一段结算点没采到"
+        // 会让资金费漏结。
+        if (request.isFutures() && request.isBuy()) {
+            backfillFundingHistory(request.symbol());
+        }
+        Map<String, BigDecimal> prices = priceSnapshot();
+
         synchronized (lock) {
-            String fundsProblem = validateFunds(request, rule, match);
+            String fundsProblem = validateFunds(request, rule, match, prices);
             if (fundsProblem != null) {
                 reject(request, fundsProblem);
             }
-            applyFill(request, rule, qty, match);
+            applyFill(request, rule, qty, match, prices);
         }
         return new OrderResult("mock-" + clientOid, clientOid);
     }
@@ -422,10 +439,12 @@ public class MockExchangeGateway implements ExchangeGateway {
      */
     @Override
     public void settleFunding() {
+        // 取价是网络调用，必须在锁外完成（见 priceSnapshot 注释）
+        Map<String, BigDecimal> prices = priceSnapshot();
         synchronized (lock) {
             for (Holding holding : holdings.values()) {
                 if (holding.perpQty.signum() > 0) {
-                    settleHolding(holding);
+                    settleHolding(holding, prices);
                 }
             }
         }
@@ -433,15 +452,37 @@ public class MockExchangeGateway implements ExchangeGateway {
 
     /** @return 模拟账户状态（后台只读展示用） */
     public AccountState state() {
+        // 取价是网络调用，必须在锁外完成（见 priceSnapshot 注释）
+        Map<String, BigDecimal> prices = priceSnapshot();
         synchronized (lock) {
             List<HoldingView> views = new ArrayList<>();
             for (Holding h : holdings.values()) {
-                BigDecimal price = lastPrice(h.futuresSymbol);
+                BigDecimal price = priceOf(prices, h.futuresSymbol);
                 views.add(new HoldingView(h.baseCoin, trim(h.spotQty), trim(h.spotAvgPrice),
                         trim(h.perpQty), trim(h.perpAvgPrice), trim(price),
                         trim(h.unrealisedPnl(price)), trim(h.spotUnrealisedPnl(price)), h.openedAt));
             }
             return new AccountState(trim(cash), trim(initialUsdt), views);
+        }
+    }
+
+    /**
+     * 各币的建仓时间（锁内只读内存，不碰网络）。
+     *
+     * <p>给策略的"最短持有期"用：刚换过去的仓位不该下一小时就被换回来。
+     *
+     * @return 交易对 → 建仓时间
+     */
+    @Override
+    public Map<String, LocalDateTime> positionOpenedAt() {
+        synchronized (lock) {
+            Map<String, LocalDateTime> result = new LinkedHashMap<>();
+            for (Holding h : holdings.values()) {
+                if (h.openedAt != null && (h.perpQty.signum() > 0 || h.spotQty.signum() > 0)) {
+                    result.put(h.futuresSymbol, h.openedAt);
+                }
+            }
+            return result;
         }
     }
 
@@ -454,8 +495,10 @@ public class MockExchangeGateway implements ExchangeGateway {
      * @param rule    交易对规则
      * @param qty     实际下单数量（平仓方向已收敛）
      * @param match   撮合结果
+     * @param prices  最新价快照（锁外取的，见 {@link #priceSnapshot()}）
      */
-    private void applyFill(Request request, Instrument rule, BigDecimal qty, MatchEngine.Match match) {
+    private void applyFill(Request request, Instrument rule, BigDecimal qty, MatchEngine.Match match,
+                           Map<String, BigDecimal> prices) {
         BigDecimal feeRate = request.isFutures() ? perpTakerFeeRate : spotTakerFeeRate;
         BigDecimal price = match.avgPrice();
         BigDecimal notional = match.filledNotional();
@@ -471,10 +514,9 @@ public class MockExchangeGateway implements ExchangeGateway {
             if (request.isBuy()) {
                 // 买回永续 = 平空：把(开仓均价 − 平仓价)兑现成现金，再扣手续费
                 tradeSide = "close";
-                // 平仓前先补拉该币最近的历史费率，再结算应计资金费：防止"币掉出篮子后
-                // 最后一段结算点没采到"导致资金费漏结（结算只在持仓存在时发生）。
-                backfillFundingHistory(holding.futuresSymbol);
-                settleHolding(holding);
+                // 结算应计资金费。补拉历史费率（网络）已由 placeOrder 在锁外完成，
+                // 这里只查库 + 用价格快照，不碰网络。
+                settleHolding(holding, prices);
                 BigDecimal closing = qty.min(holding.perpQty);
                 if (holding.perpAvgPrice != null) {
                     execPnl = holding.perpAvgPrice.subtract(price).multiply(closing)
@@ -610,7 +652,7 @@ public class MockExchangeGateway implements ExchangeGateway {
         return LocalDateTime.ofInstant(Instant.ofEpochMilli(Long.parseLong(epochMillis)), ZONE);
     }
 
-    private void settleHolding(Holding holding) {
+    private void settleHolding(Holding holding, Map<String, BigDecimal> prices) {
         try {
             LocalDateTime from = fundingIncomeMapper.findLastSettlementTime(SOURCE, holding.futuresSymbol);
             if (holding.openedAt != null && (from == null || holding.openedAt.isAfter(from))) {
@@ -624,7 +666,7 @@ public class MockExchangeGateway implements ExchangeGateway {
             if (points.isEmpty()) {
                 return;
             }
-            BigDecimal price = lastPrice(holding.futuresSymbol);
+            BigDecimal price = priceOf(prices, holding.futuresSymbol);
             if (price.signum() <= 0) {
                 log.warn("mock 资金费结算跳过 {}：取不到最新价", holding.futuresSymbol);
                 return;
@@ -704,14 +746,15 @@ public class MockExchangeGateway implements ExchangeGateway {
      *
      * @return 拒绝原因；通过返回 null
      */
-    private String validateFunds(Request request, Instrument rule, MatchEngine.Match match) {
+    private String validateFunds(Request request, Instrument rule, MatchEngine.Match match,
+                                 Map<String, BigDecimal> prices) {
         BigDecimal fee = match.filledNotional()
                 .multiply(request.isFutures() ? perpTakerFeeRate : spotTakerFeeRate);
         if (request.isFutures()) {
             if (request.isBuy()) {
                 return null;   // 平空：数量已在 capToHolding 收敛到持仓范围
             }
-            BigDecimal collateral = collateralValue();
+            BigDecimal collateral = collateralValue(prices);
             if (match.filledNotional().add(fee).compareTo(collateral) > 0) {
                 return "25202 保证金不足：开空需要 " + plain(match.filledNotional().add(fee))
                         + "，可用担保 " + plain(collateral);
@@ -733,10 +776,10 @@ public class MockExchangeGateway implements ExchangeGateway {
      *
      * @return 现金 + 折扣率 × 现货市值 + 空头浮盈亏
      */
-    private BigDecimal collateralValue() {
+    private BigDecimal collateralValue(Map<String, BigDecimal> prices) {
         BigDecimal collateral = cash;
         for (Holding h : holdings.values()) {
-            BigDecimal price = lastPrice(h.futuresSymbol);
+            BigDecimal price = priceOf(prices, h.futuresSymbol);
             collateral = collateral
                     .add(h.spotQty.multiply(price).multiply(discountRate(h.baseCoin)))
                     .add(h.unrealisedPnl(price));
@@ -812,10 +855,24 @@ public class MockExchangeGateway implements ExchangeGateway {
         return coin == null || coin.getDiscountRate() == null ? BigDecimal.ZERO : coin.getDiscountRate();
     }
 
-    /** @return 最新价（整份永续行情带缓存，缓存过期才打接口） */
-    private BigDecimal lastPrice(String symbol) {
+    /**
+     * 取"全部永续最新价"的快照（带 {@code simulation.ticker-cache-ms} 缓存）。
+     *
+     * <p><b>必须在持有 {@link #lock} 之外调用</b>：缓存过期时这里会打一次 Bitget 接口，是网络 I/O。
+     * 早期版本让各个同步块<b>内部</b>去取价，一旦接口卡住（实测：对端连接半开、本地读永不返回），
+     * 锁就被永久占住，管理后台和交易循环全部堵死（2026-10-06 故障）。
+     *
+     * <p>取价失败时沿用上一次的缓存，绝不把调用方一起拖垮——价格"旧一点"远比"整个后台卡死"好。
+     *
+     * @return 交易对 → 最新价（可能为空；取不到时调用方按 0 处理）
+     */
+    private Map<String, BigDecimal> priceSnapshot() {
         long now = System.currentTimeMillis();
-        if (now - tickerCacheAt > tickerCacheMs || tickerCache.isEmpty()) {
+        Map<String, BigDecimal> cached = tickerCache;
+        if (!cached.isEmpty() && now - tickerCacheAt <= tickerCacheMs) {
+            return cached;
+        }
+        try {
             Map<String, BigDecimal> prices = new LinkedHashMap<>();
             for (Ticker ticker : publicClient.tickers(BitgetPublicClient.USDT_FUTURES)) {
                 BigDecimal price = number(ticker.lastPrice());
@@ -823,10 +880,20 @@ public class MockExchangeGateway implements ExchangeGateway {
                     prices.put(ticker.symbol(), price);
                 }
             }
-            tickerCache = prices;
-            tickerCacheAt = now;
+            if (!prices.isEmpty()) {
+                tickerCache = prices;
+                tickerCacheAt = now;
+                return prices;
+            }
+        } catch (Exception e) {
+            log.warn("拉取最新价失败，沿用上一次缓存（{} 个币）：{}", cached.size(), e.getMessage());
         }
-        return tickerCache.getOrDefault(symbol, BigDecimal.ZERO);
+        return cached;
+    }
+
+    /** @return 快照里的最新价；没有该交易对时返回 0（与历史行为一致） */
+    private static BigDecimal priceOf(Map<String, BigDecimal> prices, String symbol) {
+        return prices.getOrDefault(symbol, BigDecimal.ZERO);
     }
 
     /**

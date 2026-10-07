@@ -46,6 +46,8 @@ public class BitgetPrivateClient {
     private final String demoPassphrase;
 
     public BitgetPrivateClient(@Value("${bitget.base-url:https://api.bitget.com}") String baseUrl,
+                               @Value("${bitget.connect-timeout-ms:5000}") int connectTimeoutMs,
+                               @Value("${bitget.read-timeout-ms:10000}") int readTimeoutMs,
                                @Value("${bitget.paptrading:false}") boolean paptrading,
                                @Value("${simulation.enabled:false}") boolean simulationEnabled,
                                @Value("${bitget.api-key:}") String realApiKey,
@@ -54,7 +56,7 @@ public class BitgetPrivateClient {
                                @Value("${bitget.demo-api-key:}") String demoApiKey,
                                @Value("${bitget.demo-secret-key:}") String demoSecretKey,
                                @Value("${bitget.demo-passphrase:}") String demoPassphrase) {
-        this.client = RestClient.builder().baseUrl(baseUrl).build();
+        this.client = RestClientFactory.create(baseUrl, connectTimeoutMs, readTimeoutMs);
         this.paptrading = paptrading;
         this.realApiKey = realApiKey;
         this.realSecretKey = realSecretKey;

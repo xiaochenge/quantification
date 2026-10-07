@@ -54,6 +54,7 @@ public class TradingLoopService {
     private final RiskService riskService;
     private final MailAlertService mailAlert;
     private final EventLogService eventLog;
+    private final WatchdogService watchdog;
 
     private final boolean enabled;
     private final boolean allowRealTrading;
@@ -79,6 +80,7 @@ public class TradingLoopService {
                               RiskService riskService,
                               MailAlertService mailAlert,
                               EventLogService eventLog,
+                              WatchdogService watchdog,
                               @Value("${strategy.enabled:true}") boolean enabled,
                               @Value("${strategy.allow-real-trading:false}") boolean allowRealTrading,
                               @Value("${strategy.target-invest-ratio:0.95}") BigDecimal targetInvestRatio,
@@ -92,6 +94,7 @@ public class TradingLoopService {
         this.riskService = riskService;
         this.mailAlert = mailAlert;
         this.eventLog = eventLog;
+        this.watchdog = watchdog;
         this.enabled = enabled;
         this.allowRealTrading = allowRealTrading;
         this.targetInvestRatio = targetInvestRatio;
@@ -117,7 +120,9 @@ public class TradingLoopService {
                 int failures = transientFailures.incrementAndGet();
                 log.warn("评估遇到瞬时网络错误（连续 {} 次），本次跳过，下个周期自动重试：{}",
                         failures, e.getMessage());
-                if (failures == transientWarnThreshold) {
+                // 第 6 次发第一封，之后每再连续 6 次再发一封（一直在坏、但不会变成邮件轰炸）。
+                // 注意不要写成 == ：那样只有恰好第 6 次会发，第 7 次以后反而永远不发了。
+                if (transientWarnThreshold > 0 && failures % transientWarnThreshold == 0) {
                     mailAlert.send("网络异常（未熔断）",
                             "连续 " + failures + " 次评估因网络错误失败，策略仍在自动重试、未熔断，"
                                     + "但请留意网络是否长时间不可用。最近一次错误：" + e.getMessage());
@@ -128,6 +133,8 @@ public class TradingLoopService {
             }
         } finally {
             loopLock.unlock();
+            // 心跳：只有"整轮完整跑完"才更新。中途卡死时这行永远到不了，看门狗会据此告警。
+            watchdog.markAlive("策略评估");
         }
     }
 
@@ -218,7 +225,10 @@ public class TradingLoopService {
         Map<String, WatchCoin> coins = strategyService.enabledCoins(exchange.mode() == TradeMode.DEMO);
         // 先算当前持仓：恢复轮数过滤只卡"新进"，已持仓的币不重复过滤（避免反复开平）
         Map<String, BigDecimal> current = currentWeights(equity, spotHoldings, perpHoldings);
-        Map<String, BigDecimal> target = strategyService.decideTarget(candidates, turnover, coins.keySet(), current.keySet());
+        // 开仓时间用于"最短持有期"：拿不到（如实盘）时该项自动不生效
+        Map<String, java.time.LocalDateTime> openedAt = exchange.positionOpenedAt();
+        Map<String, BigDecimal> target = strategyService.decideTarget(
+                candidates, turnover, coins.keySet(), current.keySet(), openedAt);
 
         log.info("决策：当前持仓 {} | 目标仓位 {}", render(current), render(target));
         if (current.keySet().equals(target.keySet())) {
